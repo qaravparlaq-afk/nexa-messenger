@@ -1,0 +1,31 @@
+# Rust
+target/
+Cargo.lock
+
+# Android
+.gradle/
+build/
+*/build/
+local.properties
+*.iml
+
+# iOS
+DerivedData/
+xcuserdata/
+Pods/
+*.xcuserstate
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/

@@ -1,15 +1,16 @@
 # NEXA Backend
 
-Initial service boundary:
+The current gateway is a development-only relay prototype.
 
-- gateway
-- identity/device directory
-- prekey distribution
-- message relay
-- encrypted attachment storage
-- push notification service
-- rate limiting / abuse controls
+Endpoints:
+- GET /health
+- POST /v1/relay — accepts an encrypted protocol envelope
+- GET /v1/relay/{device_id} — drains queued ciphertext for a device
 
-The backend must not require message plaintext for normal delivery.
+The relay stores bounded ciphertext in memory and does not decrypt message content.
 
-Production infrastructure is intentionally not provisioned yet.
+## Not production-ready
+
+The prototype intentionally has no authentication, durable storage, abuse prevention, rate limits, TLS termination, multi-region operation or persistence. Do not expose it to the public Internet.
+
+Production must add authenticated device sessions, replay/idempotency controls, rate limiting, encrypted durable storage, privacy-minimized observability, TLS/certificate management and independent security review.

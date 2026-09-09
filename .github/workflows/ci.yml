@@ -1,0 +1,20 @@
+name: NEXA CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check Rust workspace
+        run: cargo check --manifest-path core/Cargo.toml --workspace
+      - name: Test Rust workspace
+        run: cargo test --manifest-path core/Cargo.toml --workspace

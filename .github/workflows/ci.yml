@@ -8,13 +8,24 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: nexa-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
       - name: Check Rust workspace
-        run: cargo check --manifest-path core/Cargo.toml --workspace
+        run: cargo check --manifest-path core/Cargo.toml --workspace --all-targets
       - name: Test Rust workspace
-        run: cargo test --manifest-path core/Cargo.toml --workspace
+        run: cargo test --manifest-path core/Cargo.toml --workspace --all-targets

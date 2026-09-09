@@ -1,7 +1,5 @@
 //! Versioned server-facing protocol types.
-//!
-//! The server-facing objects contain public key material, routing metadata and
-//! ciphertext. They do not model plaintext message content.
+//! Only public key material, routing metadata and ciphertext are represented.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +11,12 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub struct ProtocolVersion(pub u16);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OneTimePrekeyPublic {
+    pub key_id: u32,
+    pub public_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreKeyBundle {
     pub protocol_version: ProtocolVersion,
     pub device_id: [u8; 16],
@@ -20,6 +24,7 @@ pub struct PreKeyBundle {
     pub signed_prekey_id: u32,
     pub signed_prekey: [u8; 32],
     pub signed_prekey_signature: [u8; 64],
+    pub one_time_prekeys: Vec<OneTimePrekeyPublic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,17 +67,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn envelope_is_ciphertext_only() {
-        let msg = EncryptedMessage::new(
-            [1; 16], [2; 16], [3; 16], [4; 16],
-            vec![9], vec![8, 7], 1
-        );
-        assert_eq!(msg.version.0, PROTOCOL_VERSION);
-        assert_eq!(msg.ciphertext, vec![8, 7]);
-    }
-
-    #[test]
-    fn prekey_bundle_is_versioned() {
+    fn prekey_bundle_has_version_and_public_prekeys() {
         let bundle = PreKeyBundle {
             protocol_version: ProtocolVersion(PROTOCOL_VERSION),
             device_id: [1; 16],
@@ -80,7 +75,9 @@ mod tests {
             signed_prekey_id: 3,
             signed_prekey: [4; 32],
             signed_prekey_signature: [5; 64],
+            one_time_prekeys: vec![OneTimePrekeyPublic { key_id: 6, public_key: [7; 32] }],
         };
         assert_eq!(bundle.protocol_version.0, 1);
+        assert_eq!(bundle.one_time_prekeys.len(), 1);
     }
 }

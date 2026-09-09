@@ -1,0 +1,12 @@
+[package]
+name = "nexa-session"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
+nexa-identity = { path = "../identity" }
+nexa-protocol = { path = "../protocol" }

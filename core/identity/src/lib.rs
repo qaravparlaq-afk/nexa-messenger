@@ -1,13 +1,10 @@
-//! Account and device identity primitives.
+//! Account/device identity and prekey primitives.
 //!
-//! Identity signing keys and prekey private material must remain on the device.
-//! The server receives only public material and signatures.
+//! Private identity and prekey material must remain on the device.
 
 #![forbid(unsafe_code)]
 
-use ed25519_dalek::{
-    Signature, Signer, SigningKey, Verifier, VerifyingKey,
-};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -57,10 +54,10 @@ impl SignedPrekey {
         self.public.to_bytes()
     }
 
-    /// Perform X25519 with an authenticated peer public key.
-    /// Authentication/identity binding must be enforced by the caller.
     pub fn diffie_hellman(&self, peer_public: &[u8; 32]) -> [u8; 32] {
-        self.secret.diffie_hellman(&X25519PublicKey::from(*peer_public)).to_bytes()
+        self.secret
+            .diffie_hellman(&X25519PublicKey::from(*peer_public))
+            .to_bytes()
     }
 }
 
@@ -84,6 +81,32 @@ impl SignedPrekeyRecord {
         identity_public
             .verify(&bytes, &Signature::from_bytes(&self.signature))
             .is_ok()
+    }
+}
+
+/// A one-time X25519 prekey. Its private part is consumable and must never be
+/// serialized into a server-facing bundle.
+pub struct OneTimePrekey {
+    pub key_id: u32,
+    secret: StaticSecret,
+    public: X25519PublicKey,
+}
+
+impl OneTimePrekey {
+    pub fn generate(key_id: u32) -> Self {
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let public = X25519PublicKey::from(&secret);
+        Self { key_id, secret, public }
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public.to_bytes()
+    }
+
+    pub fn diffie_hellman(&self, peer_public: &[u8; 32]) -> [u8; 32] {
+        self.secret
+            .diffie_hellman(&X25519PublicKey::from(*peer_public))
+            .to_bytes()
     }
 }
 
@@ -127,5 +150,12 @@ mod tests {
             signature: sig.to_bytes(),
         };
         assert!(!record.verify(&other.public_key()));
+    }
+
+    #[test]
+    fn one_time_prekey_has_public_component() {
+        let key = OneTimePrekey::generate(42);
+        assert_eq!(key.key_id, 42);
+        assert_eq!(key.public_key().len(), 32);
     }
 }

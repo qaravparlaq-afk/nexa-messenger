@@ -1,9 +1,9 @@
 //! Versioned server-facing protocol types.
-//! Only public key material, routing metadata and ciphertext are represented.
 
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -23,6 +23,7 @@ pub struct PreKeyBundle {
     pub identity_signing_key: [u8; 32],
     pub signed_prekey_id: u32,
     pub signed_prekey: [u8; 32],
+    #[serde(with = "BigArray")]
     pub signed_prekey_signature: [u8; 64],
     pub one_time_prekeys: Vec<OneTimePrekeyPublic>,
 }
@@ -41,23 +42,14 @@ pub struct EncryptedMessage {
 
 impl EncryptedMessage {
     pub fn new(
-        message_id: [u8; 16],
-        conversation_id: [u8; 16],
-        sender_device_id: [u8; 16],
-        recipient_device_id: [u8; 16],
-        ratchet_header: Vec<u8>,
-        ciphertext: Vec<u8>,
-        sent_at_ms: u64,
+        message_id: [u8; 16], conversation_id: [u8; 16],
+        sender_device_id: [u8; 16], recipient_device_id: [u8; 16],
+        ratchet_header: Vec<u8>, ciphertext: Vec<u8>, sent_at_ms: u64,
     ) -> Self {
         Self {
             version: ProtocolVersion(PROTOCOL_VERSION),
-            message_id,
-            conversation_id,
-            sender_device_id,
-            recipient_device_id,
-            ratchet_header,
-            ciphertext,
-            sent_at_ms,
+            message_id, conversation_id, sender_device_id, recipient_device_id,
+            ratchet_header, ciphertext, sent_at_ms,
         }
     }
 }
@@ -65,7 +57,6 @@ impl EncryptedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn prekey_bundle_has_version_and_public_prekeys() {
         let bundle = PreKeyBundle {

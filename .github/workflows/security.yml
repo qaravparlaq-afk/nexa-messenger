@@ -1,6 +1,7 @@
 name: NEXA Security Checks
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -8,24 +9,33 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: nexa-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   secret-patterns:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Reject obvious secret material
         shell: bash
         run: |
-          if grep -RInE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|seed phrase|mnemonic|xprv|-----BEGIN' . --exclude-dir=.git; then
+          if grep -RInE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|seed phrase|mnemonic|xprv|-----BEGIN' . --exclude-dir=.git --exclude-dir=target; then
             echo "Potential secret material found."
             exit 1
           fi
 
   rust-audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
       - uses: actions-rust-lang/audit@v1
         with:
           working-directory: core

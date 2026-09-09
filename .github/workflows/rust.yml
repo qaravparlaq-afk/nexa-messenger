@@ -1,6 +1,7 @@
 name: Rust Core
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -8,12 +9,20 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: rust-core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-core:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
       - name: Check workspace
         working-directory: core
         run: cargo check --workspace --all-targets

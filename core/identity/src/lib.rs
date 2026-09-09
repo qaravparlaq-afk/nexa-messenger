@@ -1,6 +1,4 @@
 //! Account/device identity and prekey primitives.
-//!
-//! Private identity and prekey material must remain on the device.
 
 #![forbid(unsafe_code)]
 
@@ -9,6 +7,7 @@ pub mod prekeys;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,7 +38,6 @@ impl SignedPrekey {
     }
 }
 
-/// A one-time X25519 prekey. Its private key is consumed by diffie_hellman.
 pub struct OneTimePrekey {
     pub key_id: u32,
     secret: StaticSecret,
@@ -62,6 +60,7 @@ impl OneTimePrekey {
 pub struct SignedPrekeyRecord {
     pub key_id: u32,
     pub public_key: [u8; 32],
+    #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }
 

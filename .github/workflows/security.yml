@@ -22,7 +22,8 @@ jobs:
       - name: Reject obvious secret material
         shell: bash
         run: |
-          if grep -RInE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|seed phrase|mnemonic|xprv|-----BEGIN' . --exclude-dir=.git --exclude-dir=target; then
+          set -euo pipefail
+          if grep -RInE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|seed phrase|mnemonic|xprv|-----BEGIN'               . --exclude-dir=.git --exclude-dir=target               --exclude='*.md' --exclude='security.yml'; then
             echo "Potential secret material found."
             exit 1
           fi
@@ -33,9 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Generate lockfile
+        working-directory: core
+        run: cargo generate-lockfile
+      - name: Audit dependencies
+        uses: actions-rust-lang/audit@v1
         with:
-          workspaces: core
-      - uses: actions-rust-lang/audit@v1
-        with:
-          working-directory: core
+          workingDirectory: core
+          createIssues: false

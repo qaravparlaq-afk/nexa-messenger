@@ -1,0 +1,31 @@
+name: NEXA Security Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  secret-patterns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject obvious secret material
+        shell: bash
+        run: |
+          if grep -RInE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|seed phrase|mnemonic|xprv|-----BEGIN' . --exclude-dir=.git; then
+            echo "Potential secret material found."
+            exit 1
+          fi
+
+  rust-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/audit@v1
+        with:
+          working-directory: core

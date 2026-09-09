@@ -143,3 +143,6 @@ mod tests {
         assert!(RatchetState::decrypt_once(&key, &packet, b"aad").is_err());
     }
 }
+
+mod receive;
+pub use receive::{ReceiveError, ReceiveRatchet};

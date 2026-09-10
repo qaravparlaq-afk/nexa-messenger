@@ -8,11 +8,8 @@ pub fn publishable_signed_prekey(
     prekey: &SignedPrekey,
 ) -> SignedPrekeyRecord {
     let public_key = prekey.public_key();
-    let bytes = SignedPrekeyRecord::signing_bytes(key_id, &public_key);
+    let agreement_public_key = identity.agreement_public_key();
+    let bytes = SignedPrekeyRecord::signing_bytes(key_id, &public_key, &agreement_public_key);
     let signature = identity.sign(&bytes);
-    SignedPrekeyRecord {
-        key_id,
-        public_key,
-        signature: signature.to_bytes(),
-    }
+    SignedPrekeyRecord { key_id, public_key, agreement_public_key, signature: signature.to_bytes() }
 }

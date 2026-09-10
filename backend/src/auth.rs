@@ -80,10 +80,6 @@ impl AuthState {
         if queue.iter().any(|(seen, _)| *seen == nonce) {
             return Err(AuthError::Replay);
         }
-        if queue.len() >= MAX_NONCES_PER_DEVICE {
-            queue.pop_front();
-        }
-        queue.push_back((nonce, now_instant + NONCE_TTL));
 
         let rate = guard.rates.entry(device_id).or_insert((now_instant, 0));
         if now_instant.duration_since(rate.0) >= RATE_WINDOW {
@@ -93,6 +89,11 @@ impl AuthState {
             return Err(AuthError::RateLimited);
         }
         rate.1 += 1;
+
+        if queue.len() >= MAX_NONCES_PER_DEVICE {
+            queue.pop_front();
+        }
+        queue.push_back((nonce, now_instant + NONCE_TTL));
         Ok(device_id)
     }
 }
@@ -169,7 +170,10 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand_core::OsRng;
+
+    fn test_key() -> SigningKey {
+        SigningKey::from_bytes(&[42u8; 32])
+    }
 
     fn signed_headers(key: &SigningKey, method: Method, path: &str, body: &[u8], timestamp: u64, nonce: [u8; 16]) -> HeaderMap {
         let public = key.verifying_key().to_bytes();
@@ -189,7 +193,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_signature_authenticates() {
-        let key = SigningKey::generate(&mut OsRng);
+        let key = test_key();
         let auth = AuthState::default();
         let headers = signed_headers(&key, Method::POST, "/v1/relay", b"ciphertext", now_ms(), [7; 16]);
         assert!(auth.authenticate(&headers, &Method::POST, "/v1/relay", b"ciphertext").await.is_ok());
@@ -197,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn tampering_is_rejected() {
-        let key = SigningKey::generate(&mut OsRng);
+        let key = test_key();
         let auth = AuthState::default();
         let headers = signed_headers(&key, Method::POST, "/v1/relay", b"a", now_ms(), [8; 16]);
         assert_eq!(auth.authenticate(&headers, &Method::POST, "/v1/relay", b"b").await, Err(AuthError::InvalidSignature));
@@ -205,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn nonce_replay_is_rejected() {
-        let key = SigningKey::generate(&mut OsRng);
+        let key = test_key();
         let auth = AuthState::default();
         let headers = signed_headers(&key, Method::GET, "/v1/relay/abc", b"", now_ms(), [9; 16]);
         assert!(auth.authenticate(&headers, &Method::GET, "/v1/relay/abc", b"").await.is_ok());
@@ -214,7 +218,7 @@ mod tests {
 
     #[test]
     fn device_id_is_deterministic() {
-        let key = SigningKey::generate(&mut OsRng);
+        let key = test_key();
         let public = key.verifying_key().to_bytes();
         assert_eq!(device_id_from_public_key(&public), device_id_from_public_key(&public));
     }

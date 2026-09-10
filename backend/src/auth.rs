@@ -75,21 +75,27 @@ impl AuthState {
         let mut guard = self.inner.lock().await;
         let now_instant = Instant::now();
 
-        let queue = guard.nonces.entry(device_id).or_default();
-        queue.retain(|(_, expires)| *expires > now_instant);
-        if queue.iter().any(|(seen, _)| *seen == nonce) {
+        let replayed = {
+            let queue = guard.nonces.entry(device_id).or_default();
+            queue.retain(|(_, expires)| *expires > now_instant);
+            queue.iter().any(|(seen, _)| *seen == nonce)
+        };
+        if replayed {
             return Err(AuthError::Replay);
         }
 
-        let rate = guard.rates.entry(device_id).or_insert((now_instant, 0));
-        if now_instant.duration_since(rate.0) >= RATE_WINDOW {
-            *rate = (now_instant, 0);
+        {
+            let rate = guard.rates.entry(device_id).or_insert((now_instant, 0));
+            if now_instant.duration_since(rate.0) >= RATE_WINDOW {
+                *rate = (now_instant, 0);
+            }
+            if rate.1 >= RATE_LIMIT_PER_DEVICE {
+                return Err(AuthError::RateLimited);
+            }
+            rate.1 += 1;
         }
-        if rate.1 >= RATE_LIMIT_PER_DEVICE {
-            return Err(AuthError::RateLimited);
-        }
-        rate.1 += 1;
 
+        let queue = guard.nonces.entry(device_id).or_default();
         if queue.len() >= MAX_NONCES_PER_DEVICE {
             queue.pop_front();
         }

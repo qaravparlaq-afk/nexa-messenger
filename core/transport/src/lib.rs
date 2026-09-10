@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const HEADER_LEN: usize = 8;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_QUEUE: usize = 1024;
 
@@ -60,6 +61,7 @@ pub enum FrameError {
     EmptyPayload,
     PayloadTooLarge,
     LengthMismatch,
+    Truncated,
 }
 
 impl Frame {
@@ -100,6 +102,51 @@ impl Frame {
             return Err(FrameError::LengthMismatch);
         }
         Ok(())
+    }
+
+    /// Encodes the stable wire header followed by the opaque payload.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameError> {
+        self.validate()?;
+        let total = HEADER_LEN
+            .checked_add(self.payload.len())
+            .ok_or(FrameError::PayloadTooLarge)?;
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&self.header.version.to_be_bytes());
+        out.push(self.header.kind);
+        out.push(self.header.flags);
+        out.extend_from_slice(&self.header.payload_len.to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    /// Decodes a complete frame. No plaintext parsing is performed here.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FrameError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(FrameError::Truncated);
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let kind = bytes[2];
+        let flags = bytes[3];
+        let payload_len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let payload_len_usize = payload_len as usize;
+        if payload_len_usize == 0 {
+            return Err(FrameError::EmptyPayload);
+        }
+        if payload_len_usize > MAX_FRAME {
+            return Err(FrameError::PayloadTooLarge);
+        }
+        let expected = HEADER_LEN
+            .checked_add(payload_len_usize)
+            .ok_or(FrameError::PayloadTooLarge)?;
+        if bytes.len() != expected {
+            return Err(FrameError::LengthMismatch);
+        }
+        let frame = Self {
+            header: FrameHeader { version, kind, flags, payload_len },
+            payload: bytes[HEADER_LEN..].to_vec(),
+        };
+        frame.validate()?;
+        Ok(frame)
     }
 }
 
@@ -152,6 +199,26 @@ mod tests {
         let frame = Frame::new(FrameKind::EncryptedMessage, 0, b"ciphertext".to_vec()).unwrap();
         assert_eq!(frame.kind().unwrap(), FrameKind::EncryptedMessage);
         assert!(frame.validate().is_ok());
+    }
+
+    #[test]
+    fn frame_round_trips_binary_encoding() {
+        let frame = Frame::new(FrameKind::EncryptedMessage, 3, b"ciphertext".to_vec()).unwrap();
+        let encoded = frame.to_bytes().unwrap();
+        assert_eq!(Frame::from_bytes(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn truncated_wire_frame_is_rejected() {
+        assert_eq!(Frame::from_bytes(&[0, 1, 2]), Err(FrameError::Truncated));
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let frame = Frame::new(FrameKind::Ping, 0, vec![1]).unwrap();
+        let mut encoded = frame.to_bytes().unwrap();
+        encoded.push(2);
+        assert_eq!(Frame::from_bytes(&encoded), Err(FrameError::LengthMismatch));
     }
 
     #[test]

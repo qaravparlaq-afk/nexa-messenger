@@ -14,31 +14,29 @@ use nexa_protocol::{decode_message_ack, EncryptedMessage};
 use nexa_transport::{Frame, FrameKind, MAX_FRAME};
 use relay::{PushResult, RelayStore};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
-use tokio::{sync::{broadcast, Mutex}, time::{sleep_until, Instant}};
+use tokio::{sync::{mpsc, Mutex}, time::{timeout, Instant}};
 
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const WS_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_MAX_MESSAGE: usize = MAX_FRAME + 8;
 const LIVE_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 struct ConnectionRegistry {
-    inner: Arc<Mutex<HashMap<[u8; 16], (u64, broadcast::Sender<EncryptedMessage>)>>>,
+    inner: Arc<Mutex<HashMap<[u8; 16], (u64, mpsc::Sender<EncryptedMessage>)>>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl Default for ConnectionRegistry {
     fn default() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicU64::new(1)),
-        }
+        Self { inner: Arc::new(Mutex::new(HashMap::new())), next_id: Arc::new(AtomicU64::new(1)) }
     }
 }
 
 impl ConnectionRegistry {
-    async fn register(&self, device: [u8; 16]) -> (u64, broadcast::Receiver<EncryptedMessage>) {
+    async fn register(&self, device: [u8; 16]) -> (u64, mpsc::Receiver<EncryptedMessage>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = broadcast::channel(LIVE_CHANNEL_CAPACITY);
+        let (sender, receiver) = mpsc::channel(LIVE_CHANNEL_CAPACITY);
         let mut guard = self.inner.lock().await;
         guard.insert(device, (id, sender));
         (id, receiver)
@@ -46,28 +44,20 @@ impl ConnectionRegistry {
 
     async fn unregister(&self, device: [u8; 16], id: u64) {
         let mut guard = self.inner.lock().await;
-        if guard.get(&device).map(|(current_id, _)| *current_id == id).unwrap_or(false) {
-            guard.remove(&device);
-        }
+        if guard.get(&device).map(|(current_id, _)| *current_id == id).unwrap_or(false) { guard.remove(&device); }
     }
 
-    async fn send(&self, device: [u8; 16], message: EncryptedMessage) {
+    async fn try_send(&self, device: [u8; 16], message: EncryptedMessage) {
         let sender = {
             let guard = self.inner.lock().await;
             guard.get(&device).map(|(_, sender)| sender.clone())
         };
-        if let Some(sender) = sender {
-            let _ = sender.send(message);
-        }
+        if let Some(sender) = sender { let _ = sender.try_send(message); }
     }
 }
 
 #[derive(Clone)]
-struct AppState {
-    relay: RelayStore,
-    auth: auth::AuthState,
-    connections: ConnectionRegistry,
-}
+struct AppState { relay: RelayStore, auth: auth::AuthState, connections: ConnectionRegistry }
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"service":"nexa-gateway","status":"ok","plaintext_storage":false,"environment":"development","authentication":"ed25519","websocket":true,"live_routing":true}))
@@ -79,10 +69,7 @@ async fn enqueue(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     if message.sender_device_id != device { return Err(StatusCode::FORBIDDEN); }
     let recipient = message.recipient_device_id;
     let response = match state.relay.push(message.clone()).await {
-        PushResult::Accepted => {
-            state.connections.send(recipient, message).await;
-            StatusCode::ACCEPTED
-        }
+        PushResult::Accepted => { state.connections.try_send(recipient, message).await; StatusCode::ACCEPTED }
         PushResult::Duplicate => StatusCode::CONFLICT,
         PushResult::Invalid => StatusCode::BAD_REQUEST,
         PushResult::Full => StatusCode::TOO_MANY_REQUESTS,
@@ -113,112 +100,67 @@ async fn websocket(State(state): State<AppState>, headers: HeaderMap, upgrade: W
 }
 
 async fn websocket_session(mut socket: WebSocket, device: [u8; 16], relay: RelayStore, connections: ConnectionRegistry) {
-    let mut hello_seen = false;
+    let first = match timeout(WS_HELLO_TIMEOUT, socket.next()).await {
+        Ok(Some(Ok(message))) => message,
+        _ => { close(&mut socket).await; return; }
+    };
 
+    let Message::Binary(bytes) = first else { close(&mut socket).await; return; };
+    if bytes.len() > WS_MAX_MESSAGE { close(&mut socket).await; return; }
+    let Ok(frame) = Frame::from_bytes(&bytes) else { close(&mut socket).await; return; };
+    let Ok(kind) = frame.kind() else { close(&mut socket).await; return; };
+    if kind != FrameKind::ClientHello || frame.payload != device { close(&mut socket).await; return; }
+
+    let (connection_id, mut outbound) = connections.register(device).await;
+    if let Err(()) = send_hello(&mut socket, device).await {
+        connections.unregister(device, connection_id).await;
+        return;
+    }
+
+    for message in relay.pull(device).await {
+        if send_encrypted(&mut socket, message).await.is_err() {
+            connections.unregister(device, connection_id).await;
+            return;
+        }
+    }
+
+    let mut last_activity = Instant::now();
     loop {
-        let next = socket.next().await;
-        let Some(result) = next else { return };
-        let Ok(message) = result else { return };
-        match message {
-            Message::Binary(bytes) => {
-                if bytes.len() > WS_MAX_MESSAGE { close(&mut socket).await; return; }
-                let Ok(frame) = Frame::from_bytes(&bytes) else { close(&mut socket).await; return; };
-                let Ok(kind) = frame.kind() else { close(&mut socket).await; return; };
-                match kind {
-                    FrameKind::Ping => {
-                        if let Ok(pong) = Frame::new(FrameKind::Pong, 0, frame.payload) {
-                            if let Ok(bytes) = pong.to_bytes() {
-                                if socket.send(Message::Binary(bytes.into())).await.is_err() { return; }
-                            }
+        let idle_deadline = last_activity + WS_IDLE_TIMEOUT;
+        tokio::select! {
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                close(&mut socket).await;
+                connections.unregister(device, connection_id).await;
+                return;
+            }
+            inbound = socket.next() => {
+                let Some(result) = inbound else { connections.unregister(device, connection_id).await; return; };
+                let Ok(message) = result else { connections.unregister(device, connection_id).await; return; };
+                last_activity = Instant::now();
+                match handle_authenticated_message(&mut socket, message, device, &relay, &connections).await {
+                    Ok(true) => {}
+                    Ok(false) | Err(()) => { connections.unregister(device, connection_id).await; return; }
+                }
+            }
+            outbound_result = outbound.recv() => {
+                match outbound_result {
+                    Some(message) => {
+                        if send_encrypted(&mut socket, message).await.is_err() {
+                            connections.unregister(device, connection_id).await;
+                            return;
                         }
                     }
-                    FrameKind::Pong => {}
-                    FrameKind::ClientHello => {
-                        if hello_seen || frame.payload != device { close(&mut socket).await; return; }
-                        hello_seen = true;
-                        let (connection_id, mut outbound) = connections.register(device).await;
-
-                        if let Ok(reply) = Frame::new(FrameKind::ClientHello, 1, device.to_vec()) {
-                            if let Ok(bytes) = reply.to_bytes() {
-                                if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                                    connections.unregister(device, connection_id).await;
-                                    return;
-                                }
-                            }
-                        }
-
-                        for message in relay.pull(device).await {
-                            if send_encrypted(&mut socket, message).await.is_err() {
-                                connections.unregister(device, connection_id).await;
-                                return;
-                            }
-                        }
-
-                        let mut last_activity = Instant::now();
-                        loop {
-                            let idle_deadline = last_activity + WS_IDLE_TIMEOUT;
-                            tokio::select! {
-                                _ = sleep_until(idle_deadline) => {
-                                    close(&mut socket).await;
-                                    connections.unregister(device, connection_id).await;
-                                    return;
-                                }
-                                inbound = socket.next() => {
-                                    let Some(result) = inbound else {
-                                        connections.unregister(device, connection_id).await;
-                                        return;
-                                    };
-                                    let Ok(message) = result else {
-                                        connections.unregister(device, connection_id).await;
-                                        return;
-                                    };
-                                    last_activity = Instant::now();
-                                    match handle_authenticated_message(&mut socket, message, device, &relay).await {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            connections.unregister(device, connection_id).await;
-                                            return;
-                                        }
-                                        Err(()) => {
-                                            connections.unregister(device, connection_id).await;
-                                            return;
-                                        }
-                                    }
-                                }
-                                outbound_result = outbound.recv() => {
-                                    match outbound_result {
-                                        Ok(message) => {
-                                            if send_encrypted(&mut socket, message).await.is_err() {
-                                                connections.unregister(device, connection_id).await;
-                                                return;
-                                            }
-                                        }
-                                        Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
-                                            close(&mut socket).await;
-                                            connections.unregister(device, connection_id).await;
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        close(&mut socket).await;
+                    None => {
+                        connections.unregister(device, connection_id).await;
                         return;
                     }
                 }
             }
-            Message::Ping(bytes) => {
-                if socket.send(Message::Pong(bytes)).await.is_err() { return; }
-            }
-            Message::Pong(_) => {}
-            Message::Text(_) | Message::Close(_) => return,
         }
     }
 }
 
-async fn handle_authenticated_message(socket: &mut WebSocket, message: Message, device: [u8; 16], relay: &RelayStore) -> Result<bool, ()> {
+async fn handle_authenticated_message(socket: &mut WebSocket, message: Message, device: [u8; 16], relay: &RelayStore, connections: &ConnectionRegistry) -> Result<bool, ()> {
     match message {
         Message::Binary(bytes) => {
             if bytes.len() > WS_MAX_MESSAGE { close(socket).await; return Err(()); }
@@ -234,8 +176,10 @@ async fn handle_authenticated_message(socket: &mut WebSocket, message: Message, 
                 FrameKind::EncryptedMessage => {
                     let message = EncryptedMessage::decode(&frame.payload).map_err(|_| ())?;
                     if message.sender_device_id != device { close(socket).await; return Err(()); }
-                    match relay.push(message).await {
-                        PushResult::Accepted | PushResult::Duplicate => {}
+                    let recipient = message.recipient_device_id;
+                    match relay.push(message.clone()).await {
+                        PushResult::Accepted => { connections.try_send(recipient, message).await; }
+                        PushResult::Duplicate => {}
                         PushResult::Invalid | PushResult::Full => { close(socket).await; return Err(()); }
                     }
                 }
@@ -257,6 +201,12 @@ async fn handle_authenticated_message(socket: &mut WebSocket, message: Message, 
         Message::Pong(_) => Ok(true),
         Message::Text(_) | Message::Close(_) => Ok(false),
     }
+}
+
+async fn send_hello(socket: &mut WebSocket, device: [u8; 16]) -> Result<(), ()> {
+    let reply = Frame::new(FrameKind::ClientHello, 1, device.to_vec()).map_err(|_| ())?;
+    let bytes = reply.to_bytes().map_err(|_| ())?;
+    socket.send(Message::Binary(bytes.into())).await.map_err(|_| ())
 }
 
 async fn send_encrypted(socket: &mut WebSocket, message: EncryptedMessage) -> Result<(), ()> {
@@ -300,4 +250,30 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind gateway");
     println!("NEXA gateway listening on {addr}");
     axum::serve(listener, app).await.expect("serve gateway");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registry_replaces_stale_connection_without_stale_unregister() {
+        let registry = ConnectionRegistry::default();
+        let device = [7u8; 16];
+        let (old_id, _old_rx) = registry.register(device).await;
+        let (new_id, mut new_rx) = registry.register(device).await;
+        assert_ne!(old_id, new_id);
+        registry.unregister(device, old_id).await;
+        registry.try_send(device, EncryptedMessage::new([1; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await;
+        assert!(new_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn registry_backpressure_never_blocks_sender() {
+        let registry = ConnectionRegistry::default();
+        let device = [8u8; 16];
+        let (_id, _rx) = registry.register(device).await;
+        for i in 0..LIVE_CHANNEL_CAPACITY { registry.try_send(device, EncryptedMessage::new([i as u8 + 1; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await; }
+        registry.try_send(device, EncryptedMessage::new([255; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await;
+    }
 }

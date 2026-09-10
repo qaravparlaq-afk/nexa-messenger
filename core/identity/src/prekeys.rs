@@ -1,6 +1,6 @@
 //! Helpers for constructing public prekey material.
 
-use crate::{IdentityKey, OneTimePrekey, SignedPrekey, SignedPrekeyRecord};
+use crate::{IdentityKey, SignedPrekey, SignedPrekeyRecord};
 
 pub fn publishable_signed_prekey(
     identity: &IdentityKey,

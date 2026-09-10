@@ -29,3 +29,20 @@ jobs:
         run: cargo check --manifest-path core/Cargo.toml --workspace --all-targets
       - name: Test Rust workspace
         run: cargo test --manifest-path core/Cargo.toml --workspace --all-targets
+
+  gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      - name: Check gateway
+        run: cargo check --manifest-path backend/Cargo.toml --all-targets
+      - name: Test gateway
+        run: cargo test --manifest-path backend/Cargo.toml --all-targets

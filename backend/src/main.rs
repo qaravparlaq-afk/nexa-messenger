@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use nexa_protocol::EncryptedMessage;
 use nexa_transport::{Frame, FrameKind, MAX_FRAME};
 use relay::{PushResult, RelayStore};
@@ -76,14 +76,14 @@ async fn ack(
     Path((device, message_id)): Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
     let device_id = hex_to_16(&device).ok_or(StatusCode::BAD_REQUEST)?;
-    let message_id = hex_to_16(&message_id).ok_or(StatusCode::BAD_REQUEST)?;
+    let message_id_bytes = hex_to_16(&message_id).ok_or(StatusCode::BAD_REQUEST)?;
     let path = format!("/v1/relay/{device}/{message_id}/ack");
     let authenticated = state.auth.authenticate(&headers, &Method::POST, &path, &[])
         .await.map_err(auth_status)?;
     if authenticated != device_id {
         return Err(StatusCode::FORBIDDEN);
     }
-    if state.relay.ack(device_id, message_id).await {
+    if state.relay.ack(device_id, message_id_bytes).await {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Ok(StatusCode::NOT_FOUND)
@@ -105,9 +105,8 @@ async fn websocket(
         .on_upgrade(move |socket| websocket_session(socket, device)))
 }
 
-async fn websocket_session(mut socket: WebSocket, device: [u8; 16]) {
+async fn websocket_session(mut socket: WebSocket, _device: [u8; 16]) {
     let mut last_activity = Instant::now();
-    let _device = device;
 
     loop {
         let remaining = WS_IDLE_TIMEOUT.saturating_sub(last_activity.elapsed());

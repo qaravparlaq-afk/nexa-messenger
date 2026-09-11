@@ -9,11 +9,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use nexa_protocol::{decode_message_ack, EncryptedMessage};
 use nexa_transport::{Frame, FrameKind, MAX_FRAME};
 use relay::{PushResult, RelayStore};
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
+use std::{collections::{HashMap, HashSet, VecDeque}, net::SocketAddr, str::FromStr, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 use tokio::{sync::{mpsc, Mutex}, time::{timeout, Instant}};
 
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -21,9 +21,16 @@ const WS_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_MAX_MESSAGE: usize = MAX_FRAME + 8;
 const LIVE_CHANNEL_CAPACITY: usize = 256;
 
+struct ConnectionState {
+    id: u64,
+    sender: mpsc::Sender<EncryptedMessage>,
+    ready: bool,
+    pending: VecDeque<EncryptedMessage>,
+}
+
 #[derive(Clone)]
 struct ConnectionRegistry {
-    inner: Arc<Mutex<HashMap<[u8; 16], (u64, mpsc::Sender<EncryptedMessage>)>>>,
+    inner: Arc<Mutex<HashMap<[u8; 16], ConnectionState>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -38,21 +45,35 @@ impl ConnectionRegistry {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(LIVE_CHANNEL_CAPACITY);
         let mut guard = self.inner.lock().await;
-        guard.insert(device, (id, sender));
+        guard.insert(device, ConnectionState { id, sender, ready: false, pending: VecDeque::new() });
         (id, receiver)
     }
 
     async fn unregister(&self, device: [u8; 16], id: u64) {
         let mut guard = self.inner.lock().await;
-        if guard.get(&device).map(|(current_id, _)| *current_id == id).unwrap_or(false) { guard.remove(&device); }
+        if guard.get(&device).map(|state| state.id == id).unwrap_or(false) { guard.remove(&device); }
     }
 
     async fn try_send(&self, device: [u8; 16], message: EncryptedMessage) {
-        let sender = {
-            let guard = self.inner.lock().await;
-            guard.get(&device).map(|(_, sender)| sender.clone())
-        };
-        if let Some(sender) = sender { let _ = sender.try_send(message); }
+        let mut guard = self.inner.lock().await;
+        let Some(state) = guard.get_mut(&device) else { return; };
+        if !state.ready {
+            if state.pending.len() < LIVE_CHANNEL_CAPACITY { state.pending.push_back(message); }
+            return;
+        }
+        let _ = state.sender.try_send(message);
+    }
+
+    async fn activate(&self, device: [u8; 16], id: u64, delivered: &HashSet<[u8; 16]>) -> bool {
+        let mut guard = self.inner.lock().await;
+        let Some(state) = guard.get_mut(&device) else { return false; };
+        if state.id != id { return false; }
+        let pending = std::mem::take(&mut state.pending);
+        state.ready = true;
+        for message in pending {
+            if !delivered.contains(&message.message_id) { let _ = state.sender.try_send(message); }
+        }
+        true
     }
 }
 
@@ -117,11 +138,16 @@ async fn websocket_session(mut socket: WebSocket, device: [u8; 16], relay: Relay
         return;
     }
 
-    for message in relay.pull(device).await {
+    let backlog = relay.pull(device).await;
+    let delivered_ids: HashSet<[u8; 16]> = backlog.iter().map(|message| message.message_id).collect();
+    for message in backlog {
         if send_encrypted(&mut socket, message).await.is_err() {
             connections.unregister(device, connection_id).await;
             return;
         }
+    }
+    if !connections.activate(device, connection_id, &delivered_ids).await {
+        return;
     }
 
     let mut last_activity = Instant::now();
@@ -256,6 +282,10 @@ async fn main() {
 mod tests {
     use super::*;
 
+    fn test_message(id: u8, device: [u8; 16]) -> EncryptedMessage {
+        EncryptedMessage::new([id; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)
+    }
+
     #[tokio::test]
     async fn registry_replaces_stale_connection_without_stale_unregister() {
         let registry = ConnectionRegistry::default();
@@ -264,16 +294,42 @@ mod tests {
         let (new_id, mut new_rx) = registry.register(device).await;
         assert_ne!(old_id, new_id);
         registry.unregister(device, old_id).await;
-        registry.try_send(device, EncryptedMessage::new([1; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await;
-        assert!(new_rx.try_recv().is_ok());
+        registry.try_send(device, test_message(1, device)).await;
+        assert!(new_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_queues_live_messages_during_backlog_and_deduplicates() {
+        let registry = ConnectionRegistry::default();
+        let device = [8u8; 16];
+        let (_id, mut rx) = registry.register(device).await;
+        let duplicate = test_message(1, device);
+        let live_only = test_message(2, device);
+        registry.try_send(device, duplicate.clone()).await;
+        registry.try_send(device, live_only.clone()).await;
+        let mut delivered = HashSet::new();
+        delivered.insert(duplicate.message_id);
+        let (id, _) = (1u64, 0u8);
+        assert!(!registry.activate(device, id, &delivered).await);
+        let (id2, _) = registry.register(device).await;
+        registry.try_send(device, duplicate.clone()).await;
+        registry.try_send(device, live_only.clone()).await;
+        let mut delivered2 = HashSet::new();
+        delivered2.insert(duplicate.message_id);
+        assert!(registry.activate(device, id2, &delivered2).await);
+        assert_eq!(rx.try_recv().err(), Some(mpsc::error::TryRecvError::Disconnected));
     }
 
     #[tokio::test]
     async fn registry_backpressure_never_blocks_sender() {
         let registry = ConnectionRegistry::default();
-        let device = [8u8; 16];
-        let (_id, _rx) = registry.register(device).await;
-        for i in 0..LIVE_CHANNEL_CAPACITY { registry.try_send(device, EncryptedMessage::new([(i as u8).wrapping_add(1); 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await; }
-        registry.try_send(device, EncryptedMessage::new([255; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await;
+        let device = [9u8; 16];
+        let (_id, mut rx) = registry.register(device).await;
+        let mut delivered = HashSet::new();
+        assert!(registry.activate(device, _id, &delivered).await);
+        for i in 0..LIVE_CHANNEL_CAPACITY { registry.try_send(device, test_message((i as u8).wrapping_add(1), device)).await; }
+        registry.try_send(device, test_message(255, device)).await;
+        for _ in 0..LIVE_CHANNEL_CAPACITY { let _ = rx.try_recv(); }
+        delivered.clear();
     }
 }

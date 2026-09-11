@@ -152,6 +152,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_ciphertext_is_rejected() {
+        let store = RelayStore::default();
+        let mut msg = message(1);
+        msg.ciphertext = vec![0u8; MAX_CIPHERTEXT + 1];
+        assert_eq!(store.push(msg).await, PushResult::Invalid);
+    }
+
+    #[tokio::test]
+    async fn oversized_ratchet_header_is_rejected() {
+        let store = RelayStore::default();
+        let mut msg = message(1);
+        msg.ratchet_header = vec![0u8; MAX_RATCHET_HEADER + 1];
+        assert_eq!(store.push(msg).await, PushResult::Invalid);
+    }
+
+    #[tokio::test]
+    async fn future_and_expired_messages_are_rejected() {
+        let store = RelayStore::default();
+        let now = now_ms();
+        let mut future = message(1);
+        future.sent_at_ms = now.saturating_add(MAX_CLOCK_SKEW_MS + 1);
+        assert_eq!(store.push(future).await, PushResult::Invalid);
+        let mut expired = message(2);
+        expired.sent_at_ms = now.saturating_sub(OFFLINE_TTL_MS + 1);
+        assert_eq!(store.push(expired).await, PushResult::Invalid);
+    }
+
+    #[tokio::test]
     async fn pull_does_not_delete_before_ack() {
         let store = RelayStore::default();
         store.push(message(1)).await;

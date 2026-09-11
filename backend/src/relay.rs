@@ -187,26 +187,26 @@ mod tests {
         let store = RelayStore::default();
         for id in 1u16..=(MAX_PER_DEVICE as u16) {
             let mut msg = message((id & 0xff) as u8);
-            msg.message_id = [id as u8; 16];
+            msg.message_id = (id as u128).to_be_bytes();
             assert_eq!(store.push(msg).await, PushResult::Accepted);
         }
         let mut extra = message(0);
-        extra.message_id = [255; 16];
+        extra.message_id = (257u128).to_be_bytes();
         assert_eq!(store.push(extra).await, PushResult::Full);
     }
 
     #[tokio::test]
     async fn global_message_limit_is_enforced_without_unbounded_growth() {
         let store = RelayStore::default();
-        for id in 0..MAX_TOTAL_MESSAGES {
+        for id in 1..=MAX_TOTAL_MESSAGES {
             let mut msg = message((id % 255 + 1) as u8);
             msg.recipient_device_id = (id as u128).to_be_bytes();
             msg.message_id = (id as u128).to_be_bytes();
             assert_eq!(store.push(msg).await, PushResult::Accepted);
         }
         let mut extra = message(1);
-        extra.message_id = [254; 16];
-        extra.recipient_device_id = [253; 16];
+        extra.message_id = (MAX_TOTAL_MESSAGES as u128 + 1).to_be_bytes();
+        extra.recipient_device_id = (MAX_TOTAL_MESSAGES as u128 + 1).to_be_bytes();
         assert_eq!(store.push(extra).await, PushResult::Full);
     }
 }

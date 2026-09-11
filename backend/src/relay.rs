@@ -137,7 +137,7 @@ mod tests {
         let mut full_probe = message(1);
         full_probe.message_id = (257u128).to_be_bytes();
         assert_eq!(store.push(full_probe).await, PushResult::Full);
-        assert!(store.ack([4; 16], [1; 16]).await);
+        assert!(store.ack([4; 16], (1u128).to_be_bytes()).await);
         let mut replacement = message(1);
         replacement.message_id = (257u128).to_be_bytes();
         assert_eq!(store.push(replacement).await, PushResult::Accepted);

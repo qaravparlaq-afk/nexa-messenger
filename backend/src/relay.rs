@@ -4,6 +4,8 @@ use nexa_protocol::{EncryptedMessage, ProtocolVersion, PROTOCOL_VERSION};
 use tokio::sync::Mutex;
 
 const MAX_PER_DEVICE: usize = 256;
+const MAX_TOTAL_MESSAGES: usize = 65_536;
+const MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CIPHERTEXT: usize = 4 * 1024 * 1024;
 const MAX_RATCHET_HEADER: usize = 16 * 1024;
 const OFFLINE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -21,11 +23,19 @@ pub enum PushResult {
 struct StoredMessage {
     message: EncryptedMessage,
     expires_at_ms: u64,
+    accounted_bytes: usize,
 }
 
 #[derive(Clone, Default)]
 pub struct RelayStore {
-    inner: Arc<Mutex<HashMap<[u8; 16], VecDeque<StoredMessage>>>>,
+    inner: Arc<Mutex<RelayInner>>,
+}
+
+#[derive(Default)]
+struct RelayInner {
+    queues: HashMap<[u8; 16], VecDeque<StoredMessage>>,
+    total_messages: usize,
+    total_bytes: usize,
 }
 
 impl RelayStore {
@@ -41,49 +51,110 @@ impl RelayStore {
             return PushResult::Invalid;
         }
 
+        let accounted_bytes = message_size(&message);
         let expires_at_ms = now.saturating_add(OFFLINE_TTL_MS);
         let mut guard = self.inner.lock().await;
-        let queue = guard.entry(message.recipient_device_id).or_default();
 
-        queue.retain(|stored| stored.expires_at_ms > now);
+        if let Some(queue) = guard.queues.get_mut(&message.recipient_device_id) {
+            remove_expired(queue, now, &mut guard.total_messages, &mut guard.total_bytes);
 
-        if queue.iter().any(|stored| stored.message.message_id == message.message_id) {
-            return PushResult::Duplicate;
+            if queue.iter().any(|stored| stored.message.message_id == message.message_id) {
+                return PushResult::Duplicate;
+            }
+            if queue.len() >= MAX_PER_DEVICE {
+                return PushResult::Full;
+            }
         }
-        if queue.len() >= MAX_PER_DEVICE {
+
+        if guard.total_messages >= MAX_TOTAL_MESSAGES
+            || guard.total_bytes.saturating_add(accounted_bytes) > MAX_TOTAL_BYTES
+        {
             return PushResult::Full;
         }
 
-        queue.push_back(StoredMessage { message, expires_at_ms });
+        guard
+            .queues
+            .entry(message.recipient_device_id)
+            .or_default()
+            .push_back(StoredMessage { message, expires_at_ms, accounted_bytes });
+        guard.total_messages += 1;
+        guard.total_bytes += accounted_bytes;
         PushResult::Accepted
     }
 
     pub async fn pull(&self, device_id: [u8; 16]) -> Vec<EncryptedMessage> {
         let now = now_ms();
         let mut guard = self.inner.lock().await;
-        let Some(queue) = guard.get_mut(&device_id) else {
+        let Some(queue) = guard.queues.get_mut(&device_id) else {
             return Vec::new();
         };
 
-        queue.retain(|stored| stored.expires_at_ms > now);
+        remove_expired(queue, now, &mut guard.total_messages, &mut guard.total_bytes);
         queue.iter().map(|stored| stored.message.clone()).collect()
     }
 
     pub async fn ack(&self, device_id: [u8; 16], message_id: [u8; 16]) -> bool {
         let mut guard = self.inner.lock().await;
-        let Some(queue) = guard.get_mut(&device_id) else {
+        let Some(queue) = guard.queues.get_mut(&device_id) else {
             return false;
         };
 
+        let mut removed_bytes = 0usize;
         let before = queue.len();
-        queue.retain(|stored| stored.message.message_id != message_id);
+        queue.retain(|stored| {
+            if stored.message.message_id == message_id {
+                removed_bytes = stored.accounted_bytes;
+                false
+            } else {
+                true
+            }
+        });
         let removed = queue.len() != before;
 
+        if removed {
+            guard.total_messages = guard.total_messages.saturating_sub(1);
+            guard.total_bytes = guard.total_bytes.saturating_sub(removed_bytes);
+        }
         if queue.is_empty() {
-            guard.remove(&device_id);
+            guard.queues.remove(&device_id);
         }
         removed
     }
+}
+
+fn remove_expired(
+    queue: &mut VecDeque<StoredMessage>,
+    now: u64,
+    total_messages: &mut usize,
+    total_bytes: &mut usize,
+) {
+    let mut removed_messages = 0usize;
+    let mut removed_bytes = 0usize;
+    queue.retain(|stored| {
+        if stored.expires_at_ms <= now {
+            removed_messages += 1;
+            removed_bytes = removed_bytes.saturating_add(stored.accounted_bytes);
+            false
+        } else {
+            true
+        }
+    });
+    *total_messages = total_messages.saturating_sub(removed_messages);
+    *total_bytes = total_bytes.saturating_sub(removed_bytes);
+}
+
+fn message_size(message: &EncryptedMessage) -> usize {
+    // Fixed wire fields: version + three/four device/conversation IDs + lengths + timestamp.
+    2usize
+        .saturating_add(16)
+        .saturating_add(16)
+        .saturating_add(16)
+        .saturating_add(16)
+        .saturating_add(4)
+        .saturating_add(message.ratchet_header.len())
+        .saturating_add(4)
+        .saturating_add(message.ciphertext.len())
+        .saturating_add(8)
 }
 
 fn valid_message(message: &EncryptedMessage) -> bool {
@@ -147,5 +218,34 @@ mod tests {
         store.push(message(1)).await;
         assert_eq!(store.pull([4; 16]).await.len(), 1);
         assert_eq!(store.pull([4; 16]).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn per_device_limit_is_enforced() {
+        let store = RelayStore::default();
+        for id in 1u16..=(MAX_PER_DEVICE as u16) {
+            let mut msg = message((id & 0xff) as u8);
+            msg.message_id = [id as u8; 16];
+            assert_eq!(store.push(msg).await, PushResult::Accepted);
+        }
+        let mut extra = message(0);
+        extra.message_id = [255; 16];
+        assert_eq!(store.push(extra).await, PushResult::Full);
+    }
+
+    #[tokio::test]
+    async fn global_message_limit_is_enforced_without_unbounded_growth() {
+        let store = RelayStore::default();
+        for id in 0..MAX_TOTAL_MESSAGES {
+            let mut msg = message((id % 255 + 1) as u8);
+            msg.recipient_device_id = (id as u128).to_be_bytes();
+            msg.message_id = (id as u128).to_be_bytes();
+            // Keep each recipient queue below MAX_PER_DEVICE; the global cap is the target here.
+            assert_eq!(store.push(msg).await, PushResult::Accepted);
+        }
+        let mut extra = message(1);
+        extra.message_id = [254; 16];
+        extra.recipient_device_id = [253; 16];
+        assert_eq!(store.push(extra).await, PushResult::Full);
     }
 }

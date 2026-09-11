@@ -8,7 +8,9 @@ const DOMAIN: &[u8] = b"M/relay-auth/v1";
 const DEVICE_ID_DOMAIN: &[u8] = b"M/device-id/v1";
 const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 const NONCE_TTL: Duration = Duration::from_secs(5 * 60);
-const MAX_NONCES_PER_DEVICE: usize = 256;
+// Must cover the maximum number of accepted requests during the nonce TTL.
+// RATE_LIMIT_PER_DEVICE allows up to 600 requests in five minutes.
+const MAX_NONCES_PER_DEVICE: usize = 1024;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RATE_LIMIT_PER_DEVICE: u32 = 120;
 
@@ -220,6 +222,12 @@ mod tests {
         let headers = signed_headers(&key, Method::GET, "/v1/relay/abc", b"", now_ms(), [9; 16]);
         assert!(auth.authenticate(&headers, &Method::GET, "/v1/relay/abc", b"").await.is_ok());
         assert_eq!(auth.authenticate(&headers, &Method::GET, "/v1/relay/abc", b"").await, Err(AuthError::Replay));
+    }
+
+    #[test]
+    fn nonce_capacity_covers_rate_window_and_ttl() {
+        let max_requests_during_ttl = RATE_LIMIT_PER_DEVICE as usize * (NONCE_TTL.as_secs() / RATE_WINDOW.as_secs());
+        assert!(MAX_NONCES_PER_DEVICE >= max_requests_during_ttl);
     }
 
     #[test]

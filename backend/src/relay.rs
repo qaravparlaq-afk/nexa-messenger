@@ -12,12 +12,7 @@ const OFFLINE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PushResult {
-    Accepted,
-    Duplicate,
-    Invalid,
-    Full,
-}
+pub enum PushResult { Accepted, Duplicate, Invalid, Full }
 
 #[derive(Debug, Clone)]
 struct StoredMessage {
@@ -27,9 +22,7 @@ struct StoredMessage {
 }
 
 #[derive(Clone, Default)]
-pub struct RelayStore {
-    inner: Arc<Mutex<RelayInner>>,
-}
+pub struct RelayStore { inner: Arc<Mutex<RelayInner>> }
 
 #[derive(Default)]
 struct RelayInner {
@@ -40,43 +33,40 @@ struct RelayInner {
 
 impl RelayStore {
     pub async fn push(&self, message: EncryptedMessage) -> PushResult {
-        if !valid_message(&message) {
-            return PushResult::Invalid;
-        }
-
+        if !valid_message(&message) { return PushResult::Invalid; }
         let now = now_ms();
         if message.sent_at_ms > now.saturating_add(MAX_CLOCK_SKEW_MS)
             || now.saturating_sub(message.sent_at_ms) > OFFLINE_TTL_MS
-        {
-            return PushResult::Invalid;
-        }
+        { return PushResult::Invalid; }
 
         let accounted_bytes = message_size(&message);
         let expires_at_ms = now.saturating_add(OFFLINE_TTL_MS);
         let mut guard = self.inner.lock().await;
+        let device_id = message.recipient_device_id;
 
-        if let Some(queue) = guard.queues.get_mut(&message.recipient_device_id) {
-            remove_expired(queue, now, &mut guard.total_messages, &mut guard.total_bytes);
+        if let Some(mut queue) = guard.queues.remove(&device_id) {
+            let (removed_messages, removed_bytes) = remove_expired(&mut queue, now);
+            guard.total_messages = guard.total_messages.saturating_sub(removed_messages);
+            guard.total_bytes = guard.total_bytes.saturating_sub(removed_bytes);
 
             if queue.iter().any(|stored| stored.message.message_id == message.message_id) {
+                guard.queues.insert(device_id, queue);
                 return PushResult::Duplicate;
             }
             if queue.len() >= MAX_PER_DEVICE {
+                guard.queues.insert(device_id, queue);
                 return PushResult::Full;
             }
+            guard.queues.insert(device_id, queue);
         }
 
         if guard.total_messages >= MAX_TOTAL_MESSAGES
             || guard.total_bytes.saturating_add(accounted_bytes) > MAX_TOTAL_BYTES
-        {
-            return PushResult::Full;
-        }
+        { return PushResult::Full; }
 
-        guard
-            .queues
-            .entry(message.recipient_device_id)
-            .or_default()
-            .push_back(StoredMessage { message, expires_at_ms, accounted_bytes });
+        guard.queues.entry(device_id).or_default().push_back(StoredMessage {
+            message, expires_at_ms, accounted_bytes,
+        });
         guard.total_messages += 1;
         guard.total_bytes += accounted_bytes;
         PushResult::Accepted
@@ -85,49 +75,37 @@ impl RelayStore {
     pub async fn pull(&self, device_id: [u8; 16]) -> Vec<EncryptedMessage> {
         let now = now_ms();
         let mut guard = self.inner.lock().await;
-        let Some(queue) = guard.queues.get_mut(&device_id) else {
-            return Vec::new();
-        };
-
-        remove_expired(queue, now, &mut guard.total_messages, &mut guard.total_bytes);
-        queue.iter().map(|stored| stored.message.clone()).collect()
+        let Some(mut queue) = guard.queues.remove(&device_id) else { return Vec::new(); };
+        let (removed_messages, removed_bytes) = remove_expired(&mut queue, now);
+        guard.total_messages = guard.total_messages.saturating_sub(removed_messages);
+        guard.total_bytes = guard.total_bytes.saturating_sub(removed_bytes);
+        let messages = queue.iter().map(|stored| stored.message.clone()).collect();
+        if !queue.is_empty() { guard.queues.insert(device_id, queue); }
+        messages
     }
 
     pub async fn ack(&self, device_id: [u8; 16], message_id: [u8; 16]) -> bool {
         let mut guard = self.inner.lock().await;
-        let Some(queue) = guard.queues.get_mut(&device_id) else {
-            return false;
-        };
-
+        let Some(mut queue) = guard.queues.remove(&device_id) else { return false; };
         let mut removed_bytes = 0usize;
         let before = queue.len();
         queue.retain(|stored| {
             if stored.message.message_id == message_id {
                 removed_bytes = stored.accounted_bytes;
                 false
-            } else {
-                true
-            }
+            } else { true }
         });
         let removed = queue.len() != before;
-
         if removed {
             guard.total_messages = guard.total_messages.saturating_sub(1);
             guard.total_bytes = guard.total_bytes.saturating_sub(removed_bytes);
         }
-        if queue.is_empty() {
-            guard.queues.remove(&device_id);
-        }
+        if !queue.is_empty() { guard.queues.insert(device_id, queue); }
         removed
     }
 }
 
-fn remove_expired(
-    queue: &mut VecDeque<StoredMessage>,
-    now: u64,
-    total_messages: &mut usize,
-    total_bytes: &mut usize,
-) {
+fn remove_expired(queue: &mut VecDeque<StoredMessage>, now: u64) -> (usize, usize) {
     let mut removed_messages = 0usize;
     let mut removed_bytes = 0usize;
     queue.retain(|stored| {
@@ -135,26 +113,15 @@ fn remove_expired(
             removed_messages += 1;
             removed_bytes = removed_bytes.saturating_add(stored.accounted_bytes);
             false
-        } else {
-            true
-        }
+        } else { true }
     });
-    *total_messages = total_messages.saturating_sub(removed_messages);
-    *total_bytes = total_bytes.saturating_sub(removed_bytes);
+    (removed_messages, removed_bytes)
 }
 
 fn message_size(message: &EncryptedMessage) -> usize {
-    // Fixed wire fields: version + three/four device/conversation IDs + lengths + timestamp.
-    2usize
-        .saturating_add(16)
-        .saturating_add(16)
-        .saturating_add(16)
-        .saturating_add(16)
-        .saturating_add(4)
-        .saturating_add(message.ratchet_header.len())
-        .saturating_add(4)
-        .saturating_add(message.ciphertext.len())
-        .saturating_add(8)
+    2usize.saturating_add(16).saturating_add(16).saturating_add(16).saturating_add(16)
+        .saturating_add(4).saturating_add(message.ratchet_header.len())
+        .saturating_add(4).saturating_add(message.ciphertext.len()).saturating_add(8)
 }
 
 fn valid_message(message: &EncryptedMessage) -> bool {
@@ -170,10 +137,7 @@ fn valid_message(message: &EncryptedMessage) -> bool {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 #[cfg(test)]
@@ -181,9 +145,7 @@ mod tests {
     use super::*;
 
     fn message(id: u8) -> EncryptedMessage {
-        EncryptedMessage::new(
-            [id; 16], [2; 16], [3; 16], [4; 16], vec![5], vec![6], now_ms(),
-        )
+        EncryptedMessage::new([id; 16], [2; 16], [3; 16], [4; 16], vec![5], vec![6], now_ms())
     }
 
     #[tokio::test]
@@ -240,7 +202,6 @@ mod tests {
             let mut msg = message((id % 255 + 1) as u8);
             msg.recipient_device_id = (id as u128).to_be_bytes();
             msg.message_id = (id as u128).to_be_bytes();
-            // Keep each recipient queue below MAX_PER_DEVICE; the global cap is the target here.
             assert_eq!(store.push(msg).await, PushResult::Accepted);
         }
         let mut extra = message(1);

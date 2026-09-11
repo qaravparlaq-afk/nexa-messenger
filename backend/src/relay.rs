@@ -15,40 +15,27 @@ const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 pub enum PushResult { Accepted, Duplicate, Invalid, Full }
 
 #[derive(Debug, Clone)]
-struct StoredMessage {
-    message: EncryptedMessage,
-    expires_at_ms: u64,
-    accounted_bytes: usize,
-}
+struct StoredMessage { message: EncryptedMessage, expires_at_ms: u64, accounted_bytes: usize }
 
 #[derive(Clone, Default)]
 pub struct RelayStore { inner: Arc<Mutex<RelayInner>> }
 
 #[derive(Default)]
-struct RelayInner {
-    queues: HashMap<[u8; 16], VecDeque<StoredMessage>>,
-    total_messages: usize,
-    total_bytes: usize,
-}
+struct RelayInner { queues: HashMap<[u8; 16], VecDeque<StoredMessage>>, total_messages: usize, total_bytes: usize }
 
 impl RelayStore {
     pub async fn push(&self, message: EncryptedMessage) -> PushResult {
         if !valid_message(&message) { return PushResult::Invalid; }
         let now = now_ms();
-        if message.sent_at_ms > now.saturating_add(MAX_CLOCK_SKEW_MS)
-            || now.saturating_sub(message.sent_at_ms) > OFFLINE_TTL_MS
-        { return PushResult::Invalid; }
-
+        if message.sent_at_ms > now.saturating_add(MAX_CLOCK_SKEW_MS) || now.saturating_sub(message.sent_at_ms) > OFFLINE_TTL_MS { return PushResult::Invalid; }
         let accounted_bytes = message_size(&message);
         let expires_at_ms = now.saturating_add(OFFLINE_TTL_MS);
         let mut guard = self.inner.lock().await;
         let device_id = message.recipient_device_id;
-
         if let Some(mut queue) = guard.queues.remove(&device_id) {
             let (removed_messages, removed_bytes) = remove_expired(&mut queue, now);
             guard.total_messages = guard.total_messages.saturating_sub(removed_messages);
             guard.total_bytes = guard.total_bytes.saturating_sub(removed_bytes);
-
             if queue.iter().any(|stored| stored.message.message_id == message.message_id) {
                 guard.queues.insert(device_id, queue);
                 return PushResult::Duplicate;
@@ -59,14 +46,8 @@ impl RelayStore {
             }
             guard.queues.insert(device_id, queue);
         }
-
-        if guard.total_messages >= MAX_TOTAL_MESSAGES
-            || guard.total_bytes.saturating_add(accounted_bytes) > MAX_TOTAL_BYTES
-        { return PushResult::Full; }
-
-        guard.queues.entry(device_id).or_default().push_back(StoredMessage {
-            message, expires_at_ms, accounted_bytes,
-        });
+        if guard.total_messages >= MAX_TOTAL_MESSAGES || guard.total_bytes.saturating_add(accounted_bytes) > MAX_TOTAL_BYTES { return PushResult::Full; }
+        guard.queues.entry(device_id).or_default().push_back(StoredMessage { message, expires_at_ms, accounted_bytes });
         guard.total_messages += 1;
         guard.total_bytes += accounted_bytes;
         PushResult::Accepted
@@ -90,10 +71,7 @@ impl RelayStore {
         let mut removed_bytes = 0usize;
         let before = queue.len();
         queue.retain(|stored| {
-            if stored.message.message_id == message_id {
-                removed_bytes = stored.accounted_bytes;
-                false
-            } else { true }
+            if stored.message.message_id == message_id { removed_bytes = stored.accounted_bytes; false } else { true }
         });
         let removed = queue.len() != before;
         if removed {
@@ -109,44 +87,26 @@ fn remove_expired(queue: &mut VecDeque<StoredMessage>, now: u64) -> (usize, usiz
     let mut removed_messages = 0usize;
     let mut removed_bytes = 0usize;
     queue.retain(|stored| {
-        if stored.expires_at_ms <= now {
-            removed_messages += 1;
-            removed_bytes = removed_bytes.saturating_add(stored.accounted_bytes);
-            false
-        } else { true }
+        if stored.expires_at_ms <= now { removed_messages += 1; removed_bytes = removed_bytes.saturating_add(stored.accounted_bytes); false } else { true }
     });
     (removed_messages, removed_bytes)
 }
 
 fn message_size(message: &EncryptedMessage) -> usize {
-    2usize.saturating_add(16).saturating_add(16).saturating_add(16).saturating_add(16)
-        .saturating_add(4).saturating_add(message.ratchet_header.len())
-        .saturating_add(4).saturating_add(message.ciphertext.len()).saturating_add(8)
+    2usize.saturating_add(16).saturating_add(16).saturating_add(16).saturating_add(16).saturating_add(4).saturating_add(message.ratchet_header.len()).saturating_add(4).saturating_add(message.ciphertext.len()).saturating_add(8)
 }
 
 fn valid_message(message: &EncryptedMessage) -> bool {
-    message.version == ProtocolVersion(PROTOCOL_VERSION)
-        && message.message_id != [0; 16]
-        && message.conversation_id != [0; 16]
-        && message.sender_device_id != [0; 16]
-        && message.recipient_device_id != [0; 16]
-        && !message.ratchet_header.is_empty()
-        && message.ratchet_header.len() <= MAX_RATCHET_HEADER
-        && !message.ciphertext.is_empty()
-        && message.ciphertext.len() <= MAX_CIPHERTEXT
+    message.version == ProtocolVersion(PROTOCOL_VERSION) && message.message_id != [0; 16] && message.conversation_id != [0; 16] && message.sender_device_id != [0; 16] && message.recipient_device_id != [0; 16] && !message.ratchet_header.is_empty() && message.ratchet_header.len() <= MAX_RATCHET_HEADER && !message.ciphertext.is_empty() && message.ciphertext.len() <= MAX_CIPHERTEXT
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
-}
+fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn message(id: u8) -> EncryptedMessage {
-        EncryptedMessage::new([id; 16], [2; 16], [3; 16], [4; 16], vec![5], vec![6], now_ms())
-    }
+    fn message(id: u8) -> EncryptedMessage { EncryptedMessage::new([id; 16], [2; 16], [3; 16], [4; 16], vec![5], vec![6], now_ms()) }
 
     #[tokio::test]
     async fn duplicate_message_is_not_queued_twice() {
@@ -164,6 +124,21 @@ mod tests {
         assert!(!store.ack([4; 16], [9; 16]).await);
         assert!(store.ack([4; 16], [1; 16]).await);
         assert_eq!(store.pull([4; 16]).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ack_releases_per_device_capacity() {
+        let store = RelayStore::default();
+        for id in 1u16..=(MAX_PER_DEVICE as u16) {
+            let mut msg = message((id & 0xff) as u8);
+            msg.message_id = (id as u128).to_be_bytes();
+            assert_eq!(store.push(msg).await, PushResult::Accepted);
+        }
+        assert_eq!(store.push(message(0)).await, PushResult::Full);
+        assert!(store.ack([4; 16], [1; 16]).await);
+        let mut replacement = message(0);
+        replacement.message_id = (257u128).to_be_bytes();
+        assert_eq!(store.push(replacement).await, PushResult::Accepted);
     }
 
     #[tokio::test]

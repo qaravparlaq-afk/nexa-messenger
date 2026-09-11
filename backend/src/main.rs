@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use nexa_protocol::{decode_message_ack, EncryptedMessage};
 use nexa_transport::{Frame, FrameKind, MAX_FRAME};
 use relay::{PushResult, RelayStore};
@@ -273,7 +273,7 @@ mod tests {
         let registry = ConnectionRegistry::default();
         let device = [8u8; 16];
         let (_id, _rx) = registry.register(device).await;
-        for i in 0..LIVE_CHANNEL_CAPACITY { registry.try_send(device, EncryptedMessage::new([i as u8 + 1; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await; }
+        for i in 0..LIVE_CHANNEL_CAPACITY { registry.try_send(device, EncryptedMessage::new([(i as u8).wrapping_add(1); 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await; }
         registry.try_send(device, EncryptedMessage::new([255; 16], [2; 16], [3; 16], device, vec![4], vec![5], 1)).await;
     }
 }

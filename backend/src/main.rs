@@ -302,34 +302,29 @@ mod tests {
     async fn registry_queues_live_messages_during_backlog_and_deduplicates() {
         let registry = ConnectionRegistry::default();
         let device = [8u8; 16];
-        let (_id, mut rx) = registry.register(device).await;
+        let (id, mut rx) = registry.register(device).await;
         let duplicate = test_message(1, device);
         let live_only = test_message(2, device);
         registry.try_send(device, duplicate.clone()).await;
         registry.try_send(device, live_only.clone()).await;
         let mut delivered = HashSet::new();
         delivered.insert(duplicate.message_id);
-        let (id, _) = (1u64, 0u8);
-        assert!(!registry.activate(device, id, &delivered).await);
-        let (id2, _) = registry.register(device).await;
-        registry.try_send(device, duplicate.clone()).await;
-        registry.try_send(device, live_only.clone()).await;
-        let mut delivered2 = HashSet::new();
-        delivered2.insert(duplicate.message_id);
-        assert!(registry.activate(device, id2, &delivered2).await);
-        assert_eq!(rx.try_recv().err(), Some(mpsc::error::TryRecvError::Disconnected));
+        assert!(registry.activate(device, id, &delivered).await);
+        assert_eq!(rx.try_recv().unwrap().message_id, live_only.message_id);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn registry_backpressure_never_blocks_sender() {
         let registry = ConnectionRegistry::default();
         let device = [9u8; 16];
-        let (_id, mut rx) = registry.register(device).await;
-        let mut delivered = HashSet::new();
-        assert!(registry.activate(device, _id, &delivered).await);
+        let (id, mut rx) = registry.register(device).await;
+        let delivered = HashSet::new();
+        assert!(registry.activate(device, id, &delivered).await);
         for i in 0..LIVE_CHANNEL_CAPACITY { registry.try_send(device, test_message((i as u8).wrapping_add(1), device)).await; }
         registry.try_send(device, test_message(255, device)).await;
-        for _ in 0..LIVE_CHANNEL_CAPACITY { let _ = rx.try_recv(); }
-        delivered.clear();
+        let mut received = 0;
+        while rx.try_recv().is_ok() { received += 1; }
+        assert_eq!(received, LIVE_CHANNEL_CAPACITY);
     }
 }

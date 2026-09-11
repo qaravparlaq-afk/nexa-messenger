@@ -134,9 +134,11 @@ mod tests {
             msg.message_id = (id as u128).to_be_bytes();
             assert_eq!(store.push(msg).await, PushResult::Accepted);
         }
-        assert_eq!(store.push(message(0)).await, PushResult::Full);
+        let mut full_probe = message(1);
+        full_probe.message_id = (257u128).to_be_bytes();
+        assert_eq!(store.push(full_probe).await, PushResult::Full);
         assert!(store.ack([4; 16], [1; 16]).await);
-        let mut replacement = message(0);
+        let mut replacement = message(1);
         replacement.message_id = (257u128).to_be_bytes();
         assert_eq!(store.push(replacement).await, PushResult::Accepted);
     }
@@ -165,7 +167,7 @@ mod tests {
             msg.message_id = (id as u128).to_be_bytes();
             assert_eq!(store.push(msg).await, PushResult::Accepted);
         }
-        let mut extra = message(0);
+        let mut extra = message(1);
         extra.message_id = (257u128).to_be_bytes();
         assert_eq!(store.push(extra).await, PushResult::Full);
     }

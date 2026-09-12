@@ -93,7 +93,7 @@ fn remove_expired(queue: &mut VecDeque<StoredMessage>, now: u64) -> (usize, usiz
 }
 
 fn message_size(message: &EncryptedMessage) -> usize {
-    2usize.saturating_add(16).saturating_add(16).saturating_add(16).saturating_add(16).saturating_add(4).saturating_add(message.ratchet_header.len()).saturating_add(4).saturating_add(message.ciphertext.len()).saturating_add(8)
+    message.encode().map(|encoded| encoded.len()).unwrap_or(usize::MAX)
 }
 
 fn valid_message(message: &EncryptedMessage) -> bool {
@@ -213,5 +213,11 @@ mod tests {
         extra.message_id = (MAX_TOTAL_MESSAGES as u128 + 1).to_be_bytes();
         extra.recipient_device_id = (MAX_TOTAL_MESSAGES as u128 + 1).to_be_bytes();
         assert_eq!(store.push(extra).await, PushResult::Full);
+    }
+
+    #[test]
+    fn accounting_size_matches_canonical_message_codec() {
+        let msg = message(9);
+        assert_eq!(message_size(&msg), msg.encode().unwrap().len());
     }
 }

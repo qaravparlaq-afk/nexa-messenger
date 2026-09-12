@@ -5,5 +5,10 @@ edition = "2021"
 
 [dependencies]
 nexa-protocol = { path = "../protocol" }
+nexa-ratchet = { path = "../ratchet" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+nexa-identity = { path = "../identity" }
+nexa-session = { path = "../session" }

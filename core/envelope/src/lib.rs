@@ -61,7 +61,7 @@ impl WireEnvelope {
 
     /// Canonical authenticated metadata. Ciphertext is deliberately excluded.
     pub fn aad(&self) -> Result<Vec<u8>, EnvelopeError> {
-        self.validate()?;
+        self.validate_metadata()?;
         let mut out = Vec::with_capacity(AAD_DOMAIN.len() + 2 + 16 * 4 + 4 + self.ratchet_header.len() + 8);
         out.extend_from_slice(AAD_DOMAIN);
         out.extend_from_slice(&self.version.0.to_be_bytes());
@@ -76,18 +76,23 @@ impl WireEnvelope {
         Ok(out)
     }
 
-    pub fn validate(&self) -> Result<(), EnvelopeError> {
+    fn validate_metadata(&self) -> Result<(), EnvelopeError> {
         if self.version.0 != PROTOCOL_VERSION {
             return Err(EnvelopeError::UnsupportedVersion);
         }
         if self.ratchet_header.len() > MAX_HEADER {
             return Err(EnvelopeError::HeaderTooLarge);
         }
-        if self.ciphertext.is_empty() || self.ciphertext.len() > MAX_CIPHERTEXT {
-            return Err(EnvelopeError::CiphertextTooLarge);
-        }
         if self.message_id == [0; 16] || self.conversation_id == [0; 16] {
             return Err(EnvelopeError::InvalidIds);
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), EnvelopeError> {
+        self.validate_metadata()?;
+        if self.ciphertext.is_empty() || self.ciphertext.len() > MAX_CIPHERTEXT {
+            return Err(EnvelopeError::CiphertextTooLarge);
         }
         Ok(())
     }
@@ -96,8 +101,7 @@ impl WireEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexa_identity::{prekeys::publishable_signed_prekey, IdentityKey, OneTimePrekey, SignedPrekey};
-    use nexa_protocol::{OneTimePrekeyPublic, PROTOCOL_VERSION};
+    use nexa_identity::{prekeys::publishable_signed_prekey, IdentityKey, SignedPrekey};
     use nexa_ratchet::{RatchetState, ReceiveRatchet};
     use nexa_session::{initiate, respond, InitiatorEphemeral};
 
@@ -161,17 +165,14 @@ mod tests {
         let root: [u8; 32] = (*initiator.root.as_bytes()).try_into().unwrap();
         let mut sender = RatchetState::from_root(root).unwrap();
         let mut receiver = ReceiveRatchet::from_root(root).unwrap();
-        let message_id = [9; 16];
-        let conversation_id = [10; 16];
-        let ratchet_header = sender.counter().to_be_bytes().to_vec();
         let mut envelope = WireEnvelope {
             version: ProtocolVersion(PROTOCOL_VERSION),
-            message_id,
-            conversation_id,
+            message_id: [9; 16],
+            conversation_id: [10; 16],
             sender_device_id: alice_device,
             recipient_device_id: bob_device,
-            ratchet_header,
-            ciphertext: Vec::new(),
+            ratchet_header: sender.counter().to_be_bytes().to_vec(),
+            ciphertext: vec![1],
             sent_at_ms: 1_000,
         };
         let aad = envelope.aad().unwrap();
@@ -189,6 +190,5 @@ mod tests {
         let tampered_aad = tampered.aad().unwrap();
         assert!(receiver.decrypt(counter, &tampered.ciphertext, &tampered_aad).is_err());
         assert_eq!(receiver.expected_counter(), 1);
-        let _ = (OneTimePrekeyPublic { key_id: 0, public_key: [0; 32] }, OneTimePrekey::generate(1));
     }
 }

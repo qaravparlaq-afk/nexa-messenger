@@ -34,9 +34,18 @@ impl ReceiveRatchet {
         target_key.ok_or(ReceiveError::Decryption)
     }
 
+    /// Decryption is transactional: an unauthenticated packet must not advance
+    /// the receive chain or consume a skipped key.
     pub fn decrypt(&mut self, counter: u64, packet: &[u8], aad: &[u8]) -> Result<Vec<u8>, ReceiveError> {
-        let key = self.key_for(counter)?;
-        crate::RatchetState::decrypt_once(&key, packet, aad).map_err(|_| ReceiveError::Decryption)
+        let mut candidate = Self {
+            state: self.state.clone(),
+            skipped: self.skipped.clone(),
+        };
+        let key = candidate.key_for(counter)?;
+        let plaintext = crate::RatchetState::decrypt_once(&key, packet, aad)
+            .map_err(|_| ReceiveError::Decryption)?;
+        *self = candidate;
+        Ok(plaintext)
     }
 }
 
@@ -56,5 +65,22 @@ mod tests {
     fn excessive_skip_is_rejected() {
         let mut receiver=ReceiveRatchet::from_root([8u8;32]).unwrap();
         assert!(matches!(receiver.key_for(MAX_SKIP+1),Err(ReceiveError::TooFarAhead)));
+    }
+    #[test]
+    fn failed_decryption_does_not_consume_receive_state() {
+        let root = [11u8; 32];
+        let mut sender = crate::RatchetState::from_root(root).unwrap();
+        let valid = sender.encrypt(b"message", b"aad").unwrap();
+        let mut tampered = valid.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        let mut receiver = ReceiveRatchet::from_root(root).unwrap();
+
+        assert!(matches!(
+            receiver.decrypt(0, &tampered, b"aad"),
+            Err(ReceiveError::Decryption)
+        ));
+        assert_eq!(receiver.expected_counter(), 0);
+        assert_eq!(receiver.skipped_count(), 0);
+        assert_eq!(receiver.decrypt(0, &valid, b"aad").unwrap(), b"message");
     }
 }

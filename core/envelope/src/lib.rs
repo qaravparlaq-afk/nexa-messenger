@@ -185,10 +185,44 @@ mod tests {
         assert_eq!(plaintext, b"hello from M");
         assert_eq!(receiver.expected_counter(), 1);
 
-        let mut tampered = decoded.clone();
-        tampered.message_id[0] ^= 1;
-        let tampered_aad = tampered.aad().unwrap();
-        assert!(receiver.decrypt(counter, &tampered.ciphertext, &tampered_aad).is_err());
-        assert_eq!(receiver.expected_counter(), 1);
+        let tampered_fields = [
+            {
+                let mut value = decoded.clone();
+                value.message_id[0] ^= 1;
+                value
+            },
+            {
+                let mut value = decoded.clone();
+                value.conversation_id[0] ^= 1;
+                value
+            },
+            {
+                let mut value = decoded.clone();
+                value.sender_device_id[0] ^= 1;
+                value
+            },
+            {
+                let mut value = decoded.clone();
+                value.recipient_device_id[0] ^= 1;
+                value
+            },
+            {
+                let mut value = decoded.clone();
+                value.ratchet_header[0] ^= 1;
+                value
+            },
+            {
+                let mut value = decoded.clone();
+                value.sent_at_ms ^= 1;
+                value
+            },
+        ];
+
+        for tampered in tampered_fields {
+            let tampered_aad = tampered.aad().unwrap();
+            assert!(receiver.decrypt(counter, &tampered.ciphertext, &tampered_aad).is_err());
+            assert_eq!(receiver.expected_counter(), 1);
+            assert_eq!(receiver.skipped_count(), 0);
+        }
     }
 }

@@ -1,4 +1,7 @@
 //! Versioned server-facing protocol types.
+//!
+//! Ratchet headers are canonical, fixed-width metadata. They are not secret,
+//! but the envelope AAD authenticates their exact encoded bytes.
 
 #![forbid(unsafe_code)]
 
@@ -6,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const RATCHET_HEADER_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
@@ -24,6 +28,50 @@ pub struct PreKeyBundle {
     #[serde(with = "BigArray")]
     pub signed_prekey_signature: [u8; 64],
     pub one_time_prekeys: Vec<OneTimePrekeyPublic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RatchetHeader {
+    pub version: u16,
+    pub message_counter: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatchetHeaderError {
+    Truncated,
+    InvalidVersion,
+    TrailingBytes,
+}
+
+impl RatchetHeader {
+    pub const ENCODED_LEN: usize = 10;
+
+    pub fn new(message_counter: u64) -> Self {
+        Self { version: RATCHET_HEADER_VERSION, message_counter }
+    }
+
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..2].copy_from_slice(&self.version.to_be_bytes());
+        out[2..].copy_from_slice(&self.message_counter.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RatchetHeaderError> {
+        if bytes.len() < Self::ENCODED_LEN {
+            return Err(RatchetHeaderError::Truncated);
+        }
+        if bytes.len() > Self::ENCODED_LEN {
+            return Err(RatchetHeaderError::TrailingBytes);
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if version != RATCHET_HEADER_VERSION {
+            return Err(RatchetHeaderError::InvalidVersion);
+        }
+        let mut counter = [0u8; 8];
+        counter.copy_from_slice(&bytes[2..]);
+        Ok(Self { version, message_counter: u64::from_be_bytes(counter) })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,8 +128,19 @@ mod tests {
         let bundle = PreKeyBundle { protocol_version: ProtocolVersion(PROTOCOL_VERSION), device_id: [1; 16], identity_signing_key: [2; 32], identity_agreement_key: [3; 32], signed_prekey_id: 4, signed_prekey: [5; 32], signed_prekey_signature: [6; 64], one_time_prekeys: vec![OneTimePrekeyPublic { key_id: 7, public_key: [8; 32] }] };
         assert_eq!(bundle.protocol_version.0, 1); assert_eq!(bundle.one_time_prekeys.len(), 1);
     }
+    #[test] fn ratchet_header_is_canonical_and_strict() {
+        let header = RatchetHeader::new(42);
+        let encoded = header.encode();
+        assert_eq!(encoded.len(), RatchetHeader::ENCODED_LEN);
+        assert_eq!(RatchetHeader::decode(&encoded).unwrap(), header);
+        assert_eq!(RatchetHeader::decode(&encoded[..9]), Err(RatchetHeaderError::Truncated));
+        let mut invalid = encoded.to_vec(); invalid[1] = 2;
+        assert_eq!(RatchetHeader::decode(&invalid), Err(RatchetHeaderError::InvalidVersion));
+        let mut trailing = encoded.to_vec(); trailing.push(0);
+        assert_eq!(RatchetHeader::decode(&trailing), Err(RatchetHeaderError::TrailingBytes));
+    }
     #[test] fn encrypted_message_binary_codec_round_trips() {
-        let message = EncryptedMessage::new([1; 16], [2; 16], [3; 16], [4; 16], vec![5, 6], vec![7, 8, 9], 123); let encoded = message.encode().unwrap(); assert_eq!(EncryptedMessage::decode(&encoded).unwrap(), message);
+        let message = EncryptedMessage::new([1; 16], [2; 16], [3; 16], [4; 16], RatchetHeader::new(0).encode().to_vec(), vec![7, 8, 9], 123); let encoded = message.encode().unwrap(); assert_eq!(EncryptedMessage::decode(&encoded).unwrap(), message);
     }
     #[test] fn message_codec_rejects_truncation_and_trailing_data() {
         let message = EncryptedMessage::new([1; 16], [2; 16], [3; 16], [4; 16], vec![5], vec![6], 123); let mut encoded = message.encode().unwrap(); encoded.pop(); assert_eq!(EncryptedMessage::decode(&encoded), Err(MessageCodecError::Truncated)); let mut encoded = message.encode().unwrap(); encoded.push(0); assert_eq!(EncryptedMessage::decode(&encoded), Err(MessageCodecError::TrailingBytes));

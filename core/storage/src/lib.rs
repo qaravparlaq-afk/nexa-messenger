@@ -114,12 +114,12 @@ impl EncryptedJournal {
         Ok(generations)
     }
 
-    fn encode_journal(generation: u64, plaintext: &[u8]) -> Result<Vec<u8>, StorageError> {
+    fn encode_journal(generation: u64, plaintext: &[u8]) -> Vec<u8> {
         let mut payload = Vec::with_capacity(JOURNAL_HEADER_LEN + plaintext.len());
         payload.extend_from_slice(JOURNAL_MAGIC);
         payload.extend_from_slice(&generation.to_be_bytes());
         payload.extend_from_slice(plaintext);
-        Ok(payload)
+        payload
     }
 
     fn decode_journal(record: &[u8], expected_generation: u64) -> Result<Vec<u8>, StorageError> {
@@ -131,9 +131,12 @@ impl EncryptedJournal {
     }
 
     pub fn save(&self, key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<u64, StorageError> {
-        let current = self.generations()?.into_iter().max().unwrap_or(0);
-        let generation = if self.generations()?.is_empty() { 0 } else { current.checked_add(1).ok_or(StorageError::GenerationOverflow)? };
-        let journal_plaintext = Self::encode_journal(generation, plaintext)?;
+        let generations = self.generations()?;
+        let generation = match generations.into_iter().max() {
+            Some(current) => current.checked_add(1).ok_or(StorageError::GenerationOverflow)?,
+            None => 0,
+        };
+        let journal_plaintext = Self::encode_journal(generation, plaintext);
         let encrypted = seal_record(key, &journal_plaintext)?;
         let temp = self.temp_path(generation);
         let final_path = self.final_path(generation);
@@ -178,6 +181,8 @@ fn sync_directory(_directory: &Path) {}
 mod tests {
     use super::*;
     use nexa_crypto::generate_key;
+    use nexa_protocol::RatchetHeader;
+    use nexa_ratchet::{ReceiveError, ReceiveRatchet, RatchetState};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("m-storage-{}-{}", name, std::process::id()));
@@ -270,6 +275,54 @@ mod tests {
         assert!(matches!(journal.load(&wrong), Err(StorageError::NoValidRecord)));
         let path = journal.final_path(0);
         fs::write(path, b"broken").unwrap();
+        assert!(matches!(journal.load(&key), Err(StorageError::NoValidRecord)));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ratchet_snapshot_survives_encrypted_restart_and_preserves_replay_protection() {
+        let root = [42u8; 32];
+        let storage_key = generate_key();
+        let dir = temp_dir("ratchet-restart");
+        let journal = EncryptedJournal::new(&dir, "receive").unwrap();
+
+        let mut sender = RatchetState::from_root(root).unwrap();
+        let packet0 = sender.encrypt(b"zero", b"aad").unwrap();
+        let packet1 = sender.encrypt(b"one", b"aad").unwrap();
+        let packet2 = sender.encrypt(b"two", b"aad").unwrap();
+
+        let mut receiver = ReceiveRatchet::from_root(root).unwrap();
+        assert_eq!(receiver.decrypt_with_header(&RatchetHeader::new(1).encode(), &packet1, b"aad").unwrap(), b"one");
+        let snapshot = receiver.snapshot().unwrap();
+        let generation = journal.save(&storage_key, &snapshot).unwrap();
+        assert_eq!(generation, 0);
+        drop(receiver);
+
+        let (_, restored_snapshot) = journal.load(&storage_key).unwrap();
+        let mut restored = ReceiveRatchet::from_snapshot(&restored_snapshot).unwrap();
+        assert_eq!(restored.decrypt_with_header(&RatchetHeader::new(0).encode(), &packet0, b"aad").unwrap(), b"zero");
+        assert_eq!(restored.decrypt_with_header(&RatchetHeader::new(2).encode(), &packet2, b"aad").unwrap(), b"two");
+        assert!(matches!(restored.decrypt_with_header(&RatchetHeader::new(1).encode(), &packet1, b"aad"), Err(ReceiveError::Replay)));
+        assert_eq!(restored.expected_counter(), 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tampered_or_wrong_key_snapshot_cannot_restore() {
+        let root = [43u8; 32];
+        let key = generate_key();
+        let wrong = generate_key();
+        let dir = temp_dir("ratchet-auth");
+        let journal = EncryptedJournal::new(&dir, "receive").unwrap();
+        let receiver = ReceiveRatchet::from_root(root).unwrap();
+        let snapshot = receiver.snapshot().unwrap();
+        journal.save(&key, &snapshot).unwrap();
+        assert!(matches!(journal.load(&wrong), Err(StorageError::NoValidRecord)));
+
+        let path = journal.final_path(0);
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(path, bytes).unwrap();
         assert!(matches!(journal.load(&key), Err(StorageError::NoValidRecord)));
         let _ = fs::remove_dir_all(dir);
     }

@@ -23,9 +23,6 @@ pub enum PreKeyStoreError {
     Poisoned,
 }
 
-/// Thread-safe one-time-prekey inventory. `take` removes the secret while
-/// holding the lock, so two concurrent session establishments cannot consume
-/// the same OPK.
 pub struct OneTimePrekeyStore {
     keys: Mutex<BTreeMap<u32, OneTimePrekey>>,
 }
@@ -40,8 +37,6 @@ impl OneTimePrekeyStore {
         Ok(())
     }
 
-    /// Atomically consumes and returns an OPK. Once returned, the secret is
-    /// owned by the caller and is no longer available from this store.
     pub fn take(&self, key_id: u32) -> Result<OneTimePrekey, PreKeyStoreError> {
         let mut keys = self.keys.lock().map_err(|_| PreKeyStoreError::Poisoned)?;
         keys.remove(&key_id).ok_or(PreKeyStoreError::NotFound)
@@ -66,7 +61,7 @@ mod tests {
     fn duplicate_ids_are_rejected() {
         let store = OneTimePrekeyStore::new();
         store.insert(OneTimePrekey::generate(7)).unwrap();
-        assert_eq!(store.insert(OneTimePrekey::generate(7)), Err(PreKeyStoreError::DuplicateKeyId));
+        assert!(matches!(store.insert(OneTimePrekey::generate(7)), Err(PreKeyStoreError::DuplicateKeyId)));
         assert_eq!(store.len().unwrap(), 1);
     }
 
@@ -76,7 +71,7 @@ mod tests {
         store.insert(OneTimePrekey::generate(8)).unwrap();
         let first = store.take(8).unwrap();
         assert_eq!(first.key_id, 8);
-        assert_eq!(store.take(8), Err(PreKeyStoreError::NotFound));
+        assert!(matches!(store.take(8), Err(PreKeyStoreError::NotFound)));
         assert!(store.is_empty().unwrap());
     }
 
@@ -89,7 +84,10 @@ mod tests {
             let store = Arc::clone(&store);
             handles.push(thread::spawn(move || store.take(9).is_ok()));
         }
-        let winners = handles.into_iter().filter(|h| h.join().unwrap()).count();
+        let mut winners = 0;
+        for handle in handles {
+            if handle.join().unwrap() { winners += 1; }
+        }
         assert_eq!(winners, 1);
         assert_eq!(store.len().unwrap(), 0);
     }

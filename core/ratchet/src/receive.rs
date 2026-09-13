@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
+use nexa_protocol::{RatchetHeader, RatchetHeaderError};
 
 const MAX_SKIP: u64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReceiveError { TooFarAhead, Replay, Decryption }
+pub enum ReceiveError { TooFarAhead, Replay, Decryption, InvalidHeader(RatchetHeaderError) }
 
 pub struct ReceiveRatchet {
     state: crate::RatchetState,
@@ -34,6 +35,14 @@ impl ReceiveRatchet {
         target_key.ok_or(ReceiveError::Decryption)
     }
 
+    /// Decode the canonical ratchet header before touching ratchet state.
+    /// Decryption remains transactional: an unauthenticated packet must not
+    /// advance the receive chain or consume a skipped key.
+    pub fn decrypt_with_header(&mut self, header_bytes: &[u8], packet: &[u8], aad: &[u8]) -> Result<Vec<u8>, ReceiveError> {
+        let header = RatchetHeader::decode(header_bytes).map_err(ReceiveError::InvalidHeader)?;
+        self.decrypt(header.message_counter, packet, aad)
+    }
+
     /// Decryption is transactional: an unauthenticated packet must not advance
     /// the receive chain or consume a skipped key.
     pub fn decrypt(&mut self, counter: u64, packet: &[u8], aad: &[u8]) -> Result<Vec<u8>, ReceiveError> {
@@ -52,35 +61,44 @@ impl ReceiveRatchet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn out_of_order_then_replay_is_rejected() {
         let root=[7u8;32]; let mut sender=crate::RatchetState::from_root(root).unwrap();
         let p0=sender.encrypt(b"zero",b"aad").unwrap(); let p1=sender.encrypt(b"one",b"aad").unwrap();
         let mut receiver=ReceiveRatchet::from_root(root).unwrap();
-        assert_eq!(receiver.decrypt(1,&p1,b"aad").unwrap(),b"one");
-        assert_eq!(receiver.decrypt(0,&p0,b"aad").unwrap(),b"zero");
-        assert!(matches!(receiver.decrypt(0,&p0,b"aad"),Err(ReceiveError::Replay)));
+        assert_eq!(receiver.decrypt_with_header(&RatchetHeader::new(1).encode(),&p1,b"aad").unwrap(),b"one");
+        assert_eq!(receiver.decrypt_with_header(&RatchetHeader::new(0).encode(),&p0,b"aad").unwrap(),b"zero");
+        assert!(matches!(receiver.decrypt_with_header(&RatchetHeader::new(0).encode(),&p0,b"aad"),Err(ReceiveError::Replay)));
     }
+
     #[test]
     fn excessive_skip_is_rejected() {
         let mut receiver=ReceiveRatchet::from_root([8u8;32]).unwrap();
         assert!(matches!(receiver.key_for(MAX_SKIP+1),Err(ReceiveError::TooFarAhead)));
     }
+
+    #[test]
+    fn malformed_header_does_not_consume_receive_state() {
+        let mut receiver=ReceiveRatchet::from_root([9u8;32]).unwrap();
+        let valid = RatchetHeader::new(0).encode();
+        let mut invalid_version = valid.to_vec(); invalid_version[1] ^= 1;
+        assert!(matches!(receiver.decrypt_with_header(&invalid_version,b"bad",b"aad"),Err(ReceiveError::InvalidHeader(RatchetHeaderError::InvalidVersion))));
+        assert_eq!(receiver.expected_counter(),0); assert_eq!(receiver.skipped_count(),0);
+        let mut trailing = valid.to_vec(); trailing.push(0);
+        assert!(matches!(receiver.decrypt_with_header(&trailing,b"bad",b"aad"),Err(ReceiveError::InvalidHeader(RatchetHeaderError::TrailingBytes))));
+        assert_eq!(receiver.expected_counter(),0); assert_eq!(receiver.skipped_count(),0);
+    }
+
     #[test]
     fn failed_decryption_does_not_consume_receive_state() {
         let root = [11u8; 32];
         let mut sender = crate::RatchetState::from_root(root).unwrap();
         let valid = sender.encrypt(b"message", b"aad").unwrap();
-        let mut tampered = valid.clone();
-        *tampered.last_mut().unwrap() ^= 1;
+        let mut tampered = valid.clone(); *tampered.last_mut().unwrap() ^= 1;
         let mut receiver = ReceiveRatchet::from_root(root).unwrap();
-
-        assert!(matches!(
-            receiver.decrypt(0, &tampered, b"aad"),
-            Err(ReceiveError::Decryption)
-        ));
-        assert_eq!(receiver.expected_counter(), 0);
-        assert_eq!(receiver.skipped_count(), 0);
-        assert_eq!(receiver.decrypt(0, &valid, b"aad").unwrap(), b"message");
+        assert!(matches!(receiver.decrypt_with_header(&RatchetHeader::new(0).encode(), &tampered, b"aad"), Err(ReceiveError::Decryption)));
+        assert_eq!(receiver.expected_counter(), 0); assert_eq!(receiver.skipped_count(), 0);
+        assert_eq!(receiver.decrypt_with_header(&RatchetHeader::new(0).encode(), &valid, b"aad").unwrap(), b"message");
     }
 }

@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 nexa-crypto = { path = "../crypto" }
+nexa-ratchet = { path = "../ratchet" }
 zeroize = "1"

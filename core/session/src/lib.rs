@@ -12,7 +12,7 @@ const DOMAIN: &[u8] = b"M/SESSION/v1";
 const ROOT_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionError { ProtocolVersion, InvalidSignedPrekey, InvalidPeerIdentity, InvalidSharedSecret, KeyDerivation }
+pub enum SessionError { ProtocolVersion, InvalidSignedPrekey, InvalidPeerIdentity, InvalidOneTimePrekey, InvalidSharedSecret, KeyDerivation }
 pub struct InitiatorEphemeral { secret: Zeroizing<[u8; 32]>, pub public_key: [u8; 32] }
 impl InitiatorEphemeral { pub fn generate() -> Self { let secret=StaticSecret::random_from_rng(rand_core::OsRng); Self{public_key:PublicKey::from(&secret).to_bytes(),secret:Zeroizing::new(secret.to_bytes())} } }
 pub struct SessionRoot(Zeroizing<[u8; ROOT_LEN]>);
@@ -30,7 +30,11 @@ pub fn initiate(own_identity:&IdentityKey,own_device_id:[u8;16],own_ephemeral:&I
     let dh3=own_ephemeral_secret.diffie_hellman(&PublicKey::from(bundle.signed_prekey)).to_bytes();
     if is_zero(&dh1)||is_zero(&dh2)||is_zero(&dh3){return Err(SessionError::InvalidSharedSecret);}
     let mut ikm=Vec::with_capacity(128);ikm.extend_from_slice(&dh1);ikm.extend_from_slice(&dh2);ikm.extend_from_slice(&dh3);
-    let used_id=if let Some((id,public))=one_time_prekey_public{let dh4=own_ephemeral_secret.diffie_hellman(&PublicKey::from(public)).to_bytes();if is_zero(&dh4){return Err(SessionError::InvalidSharedSecret);}ikm.extend_from_slice(&dh4);Some(id)}else{None};
+    let used_id=if let Some((id,public))=one_time_prekey_public{
+        let published = bundle.one_time_prekeys.iter().any(|entry| entry.key_id == id && entry.public_key == public);
+        if !published { return Err(SessionError::InvalidOneTimePrekey); }
+        let dh4=own_ephemeral_secret.diffie_hellman(&PublicKey::from(public)).to_bytes();if is_zero(&dh4){return Err(SessionError::InvalidSharedSecret);}ikm.extend_from_slice(&dh4);Some(id)
+    }else{None};
     let root=derive_root(&ikm,&own_device_id,&bundle.device_id,&own_ephemeral.public_key).ok_or(SessionError::KeyDerivation)?;ikm.zeroize();Ok(InitiatorSession{root,peer_device_id:bundle.device_id,used_one_time_prekey_id:used_id})
 }
 
@@ -47,5 +51,6 @@ mod tests{
  fn setup()->(IdentityKey,IdentityKey,SignedPrekey,SignedPrekeyRecord,PreKeyBundle){let a=IdentityKey::generate();let b=IdentityKey::generate();let spk=SignedPrekey::generate();let record=publishable_signed_prekey(&b,1,&spk);let bundle=PreKeyBundle{protocol_version:ProtocolVersion(PROTOCOL_VERSION),device_id:[7;16],identity_signing_key:b.public_key().to_bytes(),identity_agreement_key:b.agreement_public_key(),signed_prekey_id:record.key_id,signed_prekey:record.public_key,signed_prekey_signature:record.signature,one_time_prekeys:vec![]};(a,b,spk,record,bundle)}
  #[test]fn initiator_and_responder_derive_same_root(){let(a,b,spk,record,bundle)=setup();let eph=InitiatorEphemeral::generate();let i=initiate(&a,[8;16],&eph,&bundle,&record,None).unwrap();let r=respond(&b,&spk,None,[7;16],[8;16],a.agreement_public_key(),eph.public_key).unwrap();assert_eq!(i.root.as_bytes(),r.root.as_bytes());}
  #[test]fn tampered_agreement_key_rejects_session(){let(a,_,spk,record,mut bundle)=setup();bundle.identity_agreement_key[0]^=1;let eph=InitiatorEphemeral::generate();assert!(matches!(initiate(&a,[8;16],&eph,&bundle,&record,None),Err(SessionError::InvalidSignedPrekey)));let _=spk;}
+ #[test]fn unadvertised_one_time_prekey_is_rejected(){let(a,_,spk,record,bundle)=setup();let otp=OneTimePrekey::generate(9);let eph=InitiatorEphemeral::generate();assert_eq!(initiate(&a,[8;16],&eph,&bundle,&record,Some((9,otp.public_key()))),Err(SessionError::InvalidOneTimePrekey));let _=spk;}
  #[test]fn one_time_prekey_must_be_the_same_key_on_both_sides(){let(a,b,spk,record,mut bundle)=setup();let otp=OneTimePrekey::generate(9);let otp_public=otp.public_key();bundle.one_time_prekeys.push(nexa_protocol::OneTimePrekeyPublic{key_id:9,public_key:otp_public});let eph=InitiatorEphemeral::generate();let i=initiate(&a,[8;16],&eph,&bundle,&record,Some((9,otp_public))).unwrap();let r=respond(&b,&spk,Some((9,otp)),[7;16],[8;16],a.agreement_public_key(),eph.public_key).unwrap();assert_eq!(i.root.as_bytes(),r.root.as_bytes());assert_eq!(i.used_one_time_prekey_id,r.used_one_time_prekey_id);}
 }

@@ -11,6 +11,7 @@ use nexa_crypto::{open, seal, Ciphertext, CryptoError, KEY_LEN, NONCE_LEN};
 
 pub const STORAGE_FORMAT_VERSION: u16 = 1;
 pub const RECORD_HEADER_LEN: usize = 2;
+pub const AEAD_TAG_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageFormatVersion(pub u16);
@@ -24,9 +25,7 @@ pub enum StorageError {
 }
 
 impl From<CryptoError> for StorageError {
-    fn from(value: CryptoError) -> Self {
-        Self::Crypto(value)
-    }
+    fn from(value: CryptoError) -> Self { Self::Crypto(value) }
 }
 
 /// Canonical encrypted record: version (u16 BE) || nonce (12 bytes) || AEAD body.
@@ -42,22 +41,15 @@ pub fn seal_record(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, Sto
 }
 
 pub fn open_record(key: &[u8; KEY_LEN], record: &[u8]) -> Result<Vec<u8>, StorageError> {
-    if record.len() < RECORD_HEADER_LEN + NONCE_LEN {
-        return Err(StorageError::Truncated);
-    }
+    let minimum = RECORD_HEADER_LEN + NONCE_LEN + AEAD_TAG_LEN;
+    if record.len() < minimum { return Err(StorageError::Truncated); }
 
     let version = u16::from_be_bytes([record[0], record[1]]);
-    if version != STORAGE_FORMAT_VERSION {
-        return Err(StorageError::InvalidVersion);
-    }
+    if version != STORAGE_FORMAT_VERSION { return Err(StorageError::InvalidVersion); }
 
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&record[RECORD_HEADER_LEN..RECORD_HEADER_LEN + NONCE_LEN]);
     let body = record[RECORD_HEADER_LEN + NONCE_LEN..].to_vec();
-    if body.is_empty() {
-        return Err(StorageError::InvalidCiphertext);
-    }
-
     open(key, &Ciphertext { nonce, body }).map_err(StorageError::from)
 }
 
@@ -101,7 +93,10 @@ mod tests {
         assert!(matches!(open_record(&key, &record), Err(StorageError::InvalidVersion)));
 
         let short_ciphertext = [0u8; RECORD_HEADER_LEN + NONCE_LEN];
-        assert!(matches!(open_record(&key, &short_ciphertext), Err(StorageError::InvalidCiphertext)));
+        assert!(matches!(open_record(&key, &short_ciphertext), Err(StorageError::Truncated)));
+
+        let too_short_for_tag = [0u8; RECORD_HEADER_LEN + NONCE_LEN + AEAD_TAG_LEN - 1];
+        assert!(matches!(open_record(&key, &too_short_for_tag), Err(StorageError::Truncated)));
     }
 
     #[test]

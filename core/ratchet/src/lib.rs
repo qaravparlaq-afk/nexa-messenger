@@ -41,6 +41,17 @@ impl RatchetState {
         Ok(Self { chain_key: chain, next_counter: 0 })
     }
 
+    pub(crate) fn from_snapshot_parts(chain_key: [u8; 32], counter: u64) -> Result<Self, RatchetError> {
+        if counter == u64::MAX {
+            return Err(RatchetError::Kdf);
+        }
+        Ok(Self { chain_key: Zeroizing::new(chain_key), next_counter: counter })
+    }
+
+    pub(crate) fn snapshot_chain_key(&self) -> &[u8; 32] {
+        &self.chain_key
+    }
+
     pub fn counter(&self) -> u64 {
         self.next_counter
     }
@@ -145,4 +156,4 @@ mod tests {
 }
 
 mod receive;
-pub use receive::{ReceiveError, ReceiveRatchet};
+pub use receive::{ReceiveError, ReceiveRatchet, ReceiveSnapshotError};

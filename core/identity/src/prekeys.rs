@@ -51,6 +51,21 @@ impl OneTimePrekeyStore {
         keys.remove(&key_id).ok_or(PreKeyStoreError::NotFound)
     }
 
+    /// Runs a session operation while retaining the OPK until the operation succeeds.
+    /// This makes OPK consumption transactional: an establishment failure does not burn a key.
+    pub fn with_matching<R, E, F>(&self, key_id: u32, expected_public: &[u8; 32], operation: F) -> Result<R, E>
+    where
+        F: FnOnce(&OneTimePrekey) -> Result<R, E>,
+        E: From<PreKeyStoreError>,
+    {
+        let mut keys = self.keys.lock().map_err(|_| E::from(PreKeyStoreError::Poisoned))?;
+        let key = keys.get(&key_id).ok_or_else(|| E::from(PreKeyStoreError::NotFound))?;
+        if key.public_key() != *expected_public { return Err(E::from(PreKeyStoreError::PublicKeyMismatch)); }
+        let result = operation(key)?;
+        keys.remove(&key_id).ok_or_else(|| E::from(PreKeyStoreError::NotFound))?;
+        Ok(result)
+    }
+
     pub fn len(&self) -> Result<usize, PreKeyStoreError> {
         Ok(self.keys.lock().map_err(|_| PreKeyStoreError::Poisoned)?.len())
     }
@@ -94,6 +109,20 @@ mod tests {
         assert_eq!(store.len().unwrap(), 1);
         let consumed = store.take_matching(10, &public).unwrap();
         assert_eq!(consumed.key_id, 10);
+        assert!(store.is_empty().unwrap());
+    }
+
+    #[test]
+    fn transactional_operation_restores_on_error() {
+        let store = OneTimePrekeyStore::new();
+        let key = OneTimePrekey::generate(13);
+        let public = key.public_key();
+        store.insert(key).unwrap();
+        let failed: Result<(), PreKeyStoreError> = store.with_matching(13, &public, |_key| Err(PreKeyStoreError::PublicKeyMismatch));
+        assert!(matches!(failed, Err(PreKeyStoreError::PublicKeyMismatch)));
+        assert_eq!(store.len().unwrap(), 1);
+        let ok: Result<u8, PreKeyStoreError> = store.with_matching(13, &public, |_key| Ok(1));
+        assert_eq!(ok.unwrap(), 1);
         assert!(store.is_empty().unwrap());
     }
 

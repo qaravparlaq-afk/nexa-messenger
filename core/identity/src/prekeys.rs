@@ -20,6 +20,7 @@ pub fn publishable_signed_prekey(
 pub enum PreKeyStoreError {
     DuplicateKeyId,
     NotFound,
+    PublicKeyMismatch,
     Poisoned,
 }
 
@@ -39,6 +40,14 @@ impl OneTimePrekeyStore {
 
     pub fn take(&self, key_id: u32) -> Result<OneTimePrekey, PreKeyStoreError> {
         let mut keys = self.keys.lock().map_err(|_| PreKeyStoreError::Poisoned)?;
+        keys.remove(&key_id).ok_or(PreKeyStoreError::NotFound)
+    }
+
+    /// Atomically verifies the advertised public key and consumes the OPK only on a match.
+    pub fn take_matching(&self, key_id: u32, expected_public: &[u8; 32]) -> Result<OneTimePrekey, PreKeyStoreError> {
+        let mut keys = self.keys.lock().map_err(|_| PreKeyStoreError::Poisoned)?;
+        let key = keys.get(&key_id).ok_or(PreKeyStoreError::NotFound)?;
+        if key.public_key() != *expected_public { return Err(PreKeyStoreError::PublicKeyMismatch); }
         keys.remove(&key_id).ok_or(PreKeyStoreError::NotFound)
     }
 
@@ -76,13 +85,28 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_public_key_does_not_consume_prekey() {
+        let store = OneTimePrekeyStore::new();
+        let key = OneTimePrekey::generate(10);
+        let public = key.public_key();
+        store.insert(key).unwrap();
+        assert!(matches!(store.take_matching(10, &[1u8; 32]), Err(PreKeyStoreError::PublicKeyMismatch)));
+        assert_eq!(store.len().unwrap(), 1);
+        let consumed = store.take_matching(10, &public).unwrap();
+        assert_eq!(consumed.key_id, 10);
+        assert!(store.is_empty().unwrap());
+    }
+
+    #[test]
     fn concurrent_take_allows_exactly_one_consumer() {
         let store = Arc::new(OneTimePrekeyStore::new());
-        store.insert(OneTimePrekey::generate(9)).unwrap();
+        let key = OneTimePrekey::generate(9);
+        let public = key.public_key();
+        store.insert(key).unwrap();
         let mut handles = Vec::new();
         for _ in 0..16 {
             let store = Arc::clone(&store);
-            handles.push(thread::spawn(move || store.take(9).is_ok()));
+            handles.push(thread::spawn(move || store.take_matching(9, &public).is_ok()));
         }
         let mut winners = 0;
         for handle in handles {

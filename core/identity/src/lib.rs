@@ -39,33 +39,35 @@ impl IdentityKey {
     }
 }
 
-pub struct SignedPrekey { secret: StaticSecret, public: X25519PublicKey }
+pub struct SignedPrekey { secret: Zeroizing<[u8; 32]>, public: X25519PublicKey }
 impl SignedPrekey {
     pub fn generate() -> Self {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = X25519PublicKey::from(&secret);
-        Self { secret, public }
+        Self { secret: Zeroizing::new(secret.to_bytes()), public }
     }
     pub fn public_key(&self) -> [u8; 32] { self.public.to_bytes() }
     pub fn diffie_hellman(&self, peer_public: &[u8; 32]) -> [u8; 32] {
-        self.secret.diffie_hellman(&X25519PublicKey::from(*peer_public)).to_bytes()
+        let secret = StaticSecret::from(*self.secret);
+        secret.diffie_hellman(&X25519PublicKey::from(*peer_public)).to_bytes()
     }
 }
 
 pub struct OneTimePrekey {
     pub key_id: u32,
-    secret: StaticSecret,
+    secret: Zeroizing<[u8; 32]>,
     public: X25519PublicKey,
 }
 impl OneTimePrekey {
     pub fn generate(key_id: u32) -> Self {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = X25519PublicKey::from(&secret);
-        Self { key_id, secret, public }
+        Self { key_id, secret: Zeroizing::new(secret.to_bytes()), public }
     }
     pub fn public_key(&self) -> [u8; 32] { self.public.to_bytes() }
-    pub fn diffie_hellman(self, peer_public: &[u8; 32]) -> [u8; 32] {
-        self.secret.diffie_hellman(&X25519PublicKey::from(*peer_public)).to_bytes()
+    pub fn diffie_hellman(&self, peer_public: &[u8; 32]) -> [u8; 32] {
+        let secret = StaticSecret::from(*self.secret);
+        secret.diffie_hellman(&X25519PublicKey::from(*peer_public)).to_bytes()
     }
 }
 

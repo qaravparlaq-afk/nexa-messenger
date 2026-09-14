@@ -7,9 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
+use std::collections::HashSet;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const RATCHET_HEADER_VERSION: u16 = 1;
+pub const MAX_ONE_TIME_PREKEYS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion(pub u16);
@@ -31,46 +33,44 @@ pub struct PreKeyBundle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RatchetHeader {
-    pub version: u16,
-    pub message_counter: u64,
+pub enum PreKeyBundleError { InvalidVersion, ZeroDeviceId, ZeroIdentityKey, ZeroAgreementKey, ZeroSignedPrekey, TooManyOneTimePrekeys, DuplicateOneTimePrekeyId, ZeroOneTimePrekey }
+
+impl PreKeyBundle {
+    /// Validates public bundle invariants before the bundle is accepted or published.
+    /// Signature verification remains the responsibility of the identity/session layer.
+    pub fn validate(&self) -> Result<(), PreKeyBundleError> {
+        if self.protocol_version.0 != PROTOCOL_VERSION { return Err(PreKeyBundleError::InvalidVersion); }
+        if self.device_id == [0; 16] { return Err(PreKeyBundleError::ZeroDeviceId); }
+        if self.identity_signing_key == [0; 32] { return Err(PreKeyBundleError::ZeroIdentityKey); }
+        if self.identity_agreement_key == [0; 32] { return Err(PreKeyBundleError::ZeroAgreementKey); }
+        if self.signed_prekey == [0; 32] { return Err(PreKeyBundleError::ZeroSignedPrekey); }
+        if self.one_time_prekeys.len() > MAX_ONE_TIME_PREKEYS { return Err(PreKeyBundleError::TooManyOneTimePrekeys); }
+        let mut ids = HashSet::with_capacity(self.one_time_prekeys.len());
+        for key in &self.one_time_prekeys {
+            if key.public_key == [0; 32] { return Err(PreKeyBundleError::ZeroOneTimePrekey); }
+            if !ids.insert(key.key_id) { return Err(PreKeyBundleError::DuplicateOneTimePrekeyId); }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RatchetHeaderError {
-    Truncated,
-    InvalidVersion,
-    TrailingBytes,
-}
+pub struct RatchetHeader { pub version: u16, pub message_counter: u64 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatchetHeaderError { Truncated, InvalidVersion, TrailingBytes }
 
 impl RatchetHeader {
     pub const ENCODED_LEN: usize = 10;
-
-    pub fn new(message_counter: u64) -> Self {
-        Self { version: RATCHET_HEADER_VERSION, message_counter }
-    }
-
+    pub fn new(message_counter: u64) -> Self { Self { version: RATCHET_HEADER_VERSION, message_counter } }
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut out = [0u8; Self::ENCODED_LEN];
-        out[..2].copy_from_slice(&self.version.to_be_bytes());
-        out[2..].copy_from_slice(&self.message_counter.to_be_bytes());
-        out
+        let mut out = [0u8; Self::ENCODED_LEN]; out[..2].copy_from_slice(&self.version.to_be_bytes()); out[2..].copy_from_slice(&self.message_counter.to_be_bytes()); out
     }
-
     pub fn decode(bytes: &[u8]) -> Result<Self, RatchetHeaderError> {
-        if bytes.len() < Self::ENCODED_LEN {
-            return Err(RatchetHeaderError::Truncated);
-        }
-        if bytes.len() > Self::ENCODED_LEN {
-            return Err(RatchetHeaderError::TrailingBytes);
-        }
-        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
-        if version != RATCHET_HEADER_VERSION {
-            return Err(RatchetHeaderError::InvalidVersion);
-        }
-        let mut counter = [0u8; 8];
-        counter.copy_from_slice(&bytes[2..]);
-        Ok(Self { version, message_counter: u64::from_be_bytes(counter) })
+        if bytes.len() < Self::ENCODED_LEN { return Err(RatchetHeaderError::Truncated); }
+        if bytes.len() > Self::ENCODED_LEN { return Err(RatchetHeaderError::TrailingBytes); }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]); if version != RATCHET_HEADER_VERSION { return Err(RatchetHeaderError::InvalidVersion); }
+        let mut counter = [0u8; 8]; counter.copy_from_slice(&bytes[2..]); Ok(Self { version, message_counter: u64::from_be_bytes(counter) })
     }
 }
 
@@ -127,17 +127,16 @@ mod tests {
     #[test] fn prekey_bundle_has_version_and_public_prekeys() {
         let bundle = PreKeyBundle { protocol_version: ProtocolVersion(PROTOCOL_VERSION), device_id: [1; 16], identity_signing_key: [2; 32], identity_agreement_key: [3; 32], signed_prekey_id: 4, signed_prekey: [5; 32], signed_prekey_signature: [6; 64], one_time_prekeys: vec![OneTimePrekeyPublic { key_id: 7, public_key: [8; 32] }] };
         assert_eq!(bundle.protocol_version.0, 1); assert_eq!(bundle.one_time_prekeys.len(), 1);
+        assert!(bundle.validate().is_ok());
+    }
+    #[test] fn prekey_bundle_rejects_duplicate_or_excess_opks() {
+        let mut bundle = PreKeyBundle { protocol_version: ProtocolVersion(PROTOCOL_VERSION), device_id: [1; 16], identity_signing_key: [2; 32], identity_agreement_key: [3; 32], signed_prekey_id: 4, signed_prekey: [5; 32], signed_prekey_signature: [6; 64], one_time_prekeys: vec![OneTimePrekeyPublic { key_id: 7, public_key: [8; 32] }, OneTimePrekeyPublic { key_id: 7, public_key: [9; 32] }] };
+        assert_eq!(bundle.validate(), Err(PreKeyBundleError::DuplicateOneTimePrekeyId));
+        bundle.one_time_prekeys = (0..=MAX_ONE_TIME_PREKEYS).map(|id| OneTimePrekeyPublic { key_id: id as u32, public_key: [1; 32] }).collect();
+        assert_eq!(bundle.validate(), Err(PreKeyBundleError::TooManyOneTimePrekeys));
     }
     #[test] fn ratchet_header_is_canonical_and_strict() {
-        let header = RatchetHeader::new(42);
-        let encoded = header.encode();
-        assert_eq!(encoded.len(), RatchetHeader::ENCODED_LEN);
-        assert_eq!(RatchetHeader::decode(&encoded).unwrap(), header);
-        assert_eq!(RatchetHeader::decode(&encoded[..9]), Err(RatchetHeaderError::Truncated));
-        let mut invalid = encoded.to_vec(); invalid[1] = 2;
-        assert_eq!(RatchetHeader::decode(&invalid), Err(RatchetHeaderError::InvalidVersion));
-        let mut trailing = encoded.to_vec(); trailing.push(0);
-        assert_eq!(RatchetHeader::decode(&trailing), Err(RatchetHeaderError::TrailingBytes));
+        let header = RatchetHeader::new(42); let encoded = header.encode(); assert_eq!(encoded.len(), RatchetHeader::ENCODED_LEN); assert_eq!(RatchetHeader::decode(&encoded).unwrap(), header); assert_eq!(RatchetHeader::decode(&encoded[..9]), Err(RatchetHeaderError::Truncated)); let mut invalid = encoded.to_vec(); invalid[1] = 2; assert_eq!(RatchetHeader::decode(&invalid), Err(RatchetHeaderError::InvalidVersion)); let mut trailing = encoded.to_vec(); trailing.push(0); assert_eq!(RatchetHeader::decode(&trailing), Err(RatchetHeaderError::TrailingBytes));
     }
     #[test] fn encrypted_message_binary_codec_round_trips() {
         let message = EncryptedMessage::new([1; 16], [2; 16], [3; 16], [4; 16], RatchetHeader::new(0).encode().to_vec(), vec![7, 8, 9], 123); let encoded = message.encode().unwrap(); assert_eq!(EncryptedMessage::decode(&encoded).unwrap(), message);

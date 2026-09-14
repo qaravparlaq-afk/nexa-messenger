@@ -3,7 +3,7 @@
 
 use hkdf::Hkdf;
 use nexa_identity::{prekeys::{OneTimePrekeyStore, PreKeyStoreError}, IdentityKey, OneTimePrekey, SignedPrekey, SignedPrekeyRecord};
-use nexa_protocol::{PreKeyBundle, ProtocolVersion, PROTOCOL_VERSION};
+use nexa_protocol::{PreKeyBundle, PreKeyBundleError, ProtocolVersion, PROTOCOL_VERSION};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -12,7 +12,7 @@ const DOMAIN: &[u8] = b"M/SESSION/v1";
 const ROOT_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionError { ProtocolVersion, InvalidSignedPrekey, InvalidPeerIdentity, InvalidOneTimePrekey, InvalidSharedSecret, KeyDerivation, PreKeyStore(PreKeyStoreError) }
+pub enum SessionError { ProtocolVersion, InvalidBundle(PreKeyBundleError), InvalidSignedPrekey, InvalidPeerIdentity, InvalidOneTimePrekey, InvalidSharedSecret, KeyDerivation, PreKeyStore(PreKeyStoreError) }
 impl From<PreKeyStoreError> for SessionError { fn from(error: PreKeyStoreError) -> Self { Self::PreKeyStore(error) } }
 pub struct InitiatorEphemeral { secret: Zeroizing<[u8; 32]>, pub public_key: [u8; 32] }
 impl InitiatorEphemeral { pub fn generate() -> Self { let secret=StaticSecret::random_from_rng(rand_core::OsRng); Self{public_key:PublicKey::from(&secret).to_bytes(),secret:Zeroizing::new(secret.to_bytes())} } }
@@ -22,7 +22,7 @@ pub struct InitiatorSession{pub root:SessionRoot,pub peer_device_id:[u8;16],pub 
 pub struct ResponderSession{pub root:SessionRoot,pub peer_device_id:[u8;16],pub used_one_time_prekey_id:Option<u32>}
 
 pub fn initiate(own_identity:&IdentityKey,own_device_id:[u8;16],own_ephemeral:&InitiatorEphemeral,bundle:&PreKeyBundle,signed_prekey_record:&SignedPrekeyRecord,one_time_prekey_public:Option<(u32,[u8;32])>)->Result<InitiatorSession,SessionError>{
-    if bundle.protocol_version.0!=PROTOCOL_VERSION{return Err(SessionError::ProtocolVersion);}
+    bundle.validate().map_err(SessionError::InvalidBundle)?;
     let peer_identity=ed25519_dalek::VerifyingKey::from_bytes(&bundle.identity_signing_key).map_err(|_|SessionError::InvalidPeerIdentity)?;
     if bundle.identity_agreement_key!=signed_prekey_record.agreement_public_key||!signed_prekey_record.verify(&peer_identity)||signed_prekey_record.key_id!=bundle.signed_prekey_id||signed_prekey_record.public_key!=bundle.signed_prekey{return Err(SessionError::InvalidSignedPrekey);}
     let own_ephemeral_secret=StaticSecret::from(*own_ephemeral.secret);
@@ -59,9 +59,10 @@ mod tests{
  use super::*;use nexa_identity::{prekeys::publishable_signed_prekey,IdentityKey};
  fn setup()->(IdentityKey,IdentityKey,SignedPrekey,SignedPrekeyRecord,PreKeyBundle){let a=IdentityKey::generate();let b=IdentityKey::generate();let spk=SignedPrekey::generate();let record=publishable_signed_prekey(&b,1,&spk);let bundle=PreKeyBundle{protocol_version:ProtocolVersion(PROTOCOL_VERSION),device_id:[7;16],identity_signing_key:b.public_key().to_bytes(),identity_agreement_key:b.agreement_public_key(),signed_prekey_id:record.key_id,signed_prekey:record.public_key,signed_prekey_signature:record.signature,one_time_prekeys:vec![]};(a,b,spk,record,bundle)}
  #[test]fn initiator_and_responder_derive_same_root(){let(a,b,spk,record,bundle)=setup();let eph=InitiatorEphemeral::generate();let i=initiate(&a,[8;16],&eph,&bundle,&record,None).unwrap();let r=respond(&b,&spk,None,[7;16],[8;16],a.agreement_public_key(),eph.public_key).unwrap();assert_eq!(i.root.as_bytes(),r.root.as_bytes());}
+ #[test]fn malformed_bundle_is_rejected_before_dh(){let(a,_,spk,record,mut bundle)=setup();bundle.device_id=[0;16];let eph=InitiatorEphemeral::generate();assert!(matches!(initiate(&a,[8;16],&eph,&bundle,&record,None),Err(SessionError::InvalidBundle(PreKeyBundleError::ZeroDeviceId))));let _=spk;}
  #[test]fn tampered_agreement_key_rejects_session(){let(a,_,spk,record,mut bundle)=setup();bundle.identity_agreement_key[0]^=1;let eph=InitiatorEphemeral::generate();assert!(matches!(initiate(&a,[8;16],&eph,&bundle,&record,None),Err(SessionError::InvalidSignedPrekey)));let _=spk;}
  #[test]fn unadvertised_one_time_prekey_is_rejected(){let(a,_,spk,record,bundle)=setup();let otp=OneTimePrekey::generate(9);let eph=InitiatorEphemeral::generate();assert!(matches!(initiate(&a,[8;16],&eph,&bundle,&record,Some((9,otp.public_key()))),Err(SessionError::InvalidOneTimePrekey)));let _=spk;}
  #[test]fn one_time_prekey_must_be_the_same_key_on_both_sides(){let(a,b,spk,record,mut bundle)=setup();let otp=OneTimePrekey::generate(9);let otp_public=otp.public_key();bundle.one_time_prekeys.push(nexa_protocol::OneTimePrekeyPublic{key_id:9,public_key:otp_public});let eph=InitiatorEphemeral::generate();let i=initiate(&a,[8;16],&eph,&bundle,&record,Some((9,otp_public))).unwrap();let r=respond(&b,&spk,Some((9,otp)),[7;16],[8;16],a.agreement_public_key(),eph.public_key).unwrap();assert_eq!(i.root.as_bytes(),r.root.as_bytes());assert_eq!(i.used_one_time_prekey_id,r.used_one_time_prekey_id);}
- #[test]fn responder_store_consumes_matching_opk_exactly_once(){let(a,b,spk,record,mut bundle)=setup();let otp=OneTimePrekey::generate(11);let public=otp.public_key();bundle.one_time_prekeys.push(nexa_protocol::OneTimePrekeyPublic{key_id:11,public_key:public});let store=OneTimePrekeyStore::new();store.insert(otp).unwrap();let eph=InitiatorEphemeral::generate();let i=initiate(&a,[8;16],&eph,&bundle,&record,Some((11,public))).unwrap();let r=respond_with_one_time_prekey_store(&b,&spk,&store,Some((11,public)),[7;16],[8;16],a.agreement_public_key(),eph.public_key).unwrap();assert_eq!(i.root.as_bytes(),r.root.as_bytes());assert_eq!(store.len().unwrap(),0);assert!(matches!(respond_with_one_time_prekey_store(&b,&spk,&store,Some((11,public)),[7;16],[8;16],a.agreement_public_key(),eph.public_key),Err(SessionError::PreKeyStore(PreKeyStoreError::NotFound))));}
+ #[test]fn responder_store_consumes_matching_opk_exactly_once(){let(a,b,spk,record,mut bundle)=setup();let otp=OneTimePrekey::generate(11);let public=otp.public_key();bundle.one_time_prekeys.push(nexa_protocol::OneTimePrekeyPublic{key_id:11,public_key:public});let store=OneTimePrekeyStore::new();store.insert(otp).unwrap();let eph=InitiatorEphemeral::generate();let i=initiate(&a,[8;16],&eph,&bundle, &record,Some((11,public))).unwrap();let r=respond_with_one_time_prekey_store(&b,&spk,&store,Some((11,public)),[7;16],[8;16],a.agreement_public_key(),eph.public_key).unwrap();assert_eq!(i.root.as_bytes(),r.root.as_bytes());assert_eq!(store.len().unwrap(),0);assert!(matches!(respond_with_one_time_prekey_store(&b,&spk,&store,Some((11,public)),[7;16],[8;16],a.agreement_public_key(),eph.public_key),Err(SessionError::PreKeyStore(PreKeyStoreError::NotFound))));}
  #[test]fn responder_store_does_not_consume_on_session_failure(){let(_,b,spk,_,_)=setup();let otp=OneTimePrekey::generate(12);let public=otp.public_key();let store=OneTimePrekeyStore::new();store.insert(otp).unwrap();let result=respond_with_one_time_prekey_store(&b,&spk,&store,Some((12,public)),[7;16],[8;16],[3u8;32],[0u8;32]);assert!(matches!(result,Err(SessionError::InvalidSharedSecret)));assert_eq!(store.len().unwrap(),1);}
 }

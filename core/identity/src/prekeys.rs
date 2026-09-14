@@ -41,17 +41,16 @@ struct SignedPrekeyState {
     retired: BTreeMap<u32, SignedPrekeyEntry>,
 }
 
-/// Holds the active signed prekey and a bounded grace-period set of retired keys.
+/// Holds the active signed prekey and a grace-period set of retired keys.
 /// Retired keys remain available so sessions created from a recently published
-/// bundle can still complete after rotation. Expired keys are removed explicitly
-/// by `prune` and are never returned by `with_key`.
+/// bundle can still complete after rotation. Expired keys are removed by `prune`.
 pub struct SignedPrekeyStore {
     state: Mutex<SignedPrekeyState>,
 }
 
 impl SignedPrekeyStore {
     pub fn new(identity: &IdentityKey, key_id: u32, now_ms: u64) -> Self {
-        let key = SignedPrekey::generate(key_id);
+        let key = SignedPrekey::generate();
         let record = publishable_signed_prekey(identity, key_id, &key);
         Self {
             state: Mutex::new(SignedPrekeyState {
@@ -70,8 +69,7 @@ impl SignedPrekeyStore {
         Ok(self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?.current.key_id)
     }
 
-    /// Returns the private signed prekey for a published key id while keeping it in storage.
-    /// The closure should perform only the work needed to establish the session.
+    /// Returns a private signed prekey for a published id while retaining it in storage.
     pub fn with_key<R, F>(&self, key_id: u32, now_ms: u64, operation: F) -> Result<R, SignedPrekeyStoreError>
     where
         F: FnOnce(&SignedPrekey) -> R,
@@ -88,7 +86,6 @@ impl SignedPrekeyStore {
     }
 
     /// Rotates to a fresh signed prekey. The old key is retained only for `grace_ms`.
-    /// Key ids may never be reused while the old entry remains in the store.
     pub fn rotate(
         &self,
         identity: &IdentityKey,
@@ -104,16 +101,16 @@ impl SignedPrekeyStore {
             return Err(SignedPrekeyStoreError::InvalidTime);
         }
         let expires_at_ms = now_ms.checked_add(grace_ms).ok_or(SignedPrekeyStoreError::GenerationOverflow)?;
-        let old = std::mem::replace(&mut state.current, {
-            let key = SignedPrekey::generate(new_key_id);
-            let record = publishable_signed_prekey(identity, new_key_id, &key);
-            SignedPrekeyEntry { key_id: new_key_id, created_at_ms: now_ms, expires_at_ms: None, key, record }
-        });
+        let key = SignedPrekey::generate();
+        let record = publishable_signed_prekey(identity, new_key_id, &key);
+        let old = std::mem::replace(
+            &mut state.current,
+            SignedPrekeyEntry { key_id: new_key_id, created_at_ms: now_ms, expires_at_ms: None, key, record },
+        );
         state.retired.insert(old.key_id, SignedPrekeyEntry { expires_at_ms: Some(expires_at_ms), ..old });
         Ok(state.current.record.clone())
     }
 
-    /// Removes retired keys whose grace period has ended.
     pub fn prune(&self, now_ms: u64) -> Result<usize, SignedPrekeyStoreError> {
         let mut state = self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?;
         let before = state.retired.len();
@@ -153,7 +150,6 @@ impl OneTimePrekeyStore {
         keys.remove(&key_id).ok_or(PreKeyStoreError::NotFound)
     }
 
-    /// Atomically verifies the advertised public key and consumes the OPK only on a match.
     pub fn take_matching(&self, key_id: u32, expected_public: &[u8; 32]) -> Result<OneTimePrekey, PreKeyStoreError> {
         let mut keys = self.keys.lock().map_err(|_| PreKeyStoreError::Poisoned)?;
         let key = keys.get(&key_id).ok_or(PreKeyStoreError::NotFound)?;
@@ -161,8 +157,6 @@ impl OneTimePrekeyStore {
         keys.remove(&key_id).ok_or(PreKeyStoreError::NotFound)
     }
 
-    /// Runs a session operation while retaining the OPK until the operation succeeds.
-    /// This makes OPK consumption transactional: an establishment failure does not burn a key.
     pub fn with_matching<R, E, F>(&self, key_id: u32, expected_public: &[u8; 32], operation: F) -> Result<R, E>
     where
         F: FnOnce(&OneTimePrekey) -> Result<R, E>,

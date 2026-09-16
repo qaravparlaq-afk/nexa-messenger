@@ -31,29 +31,15 @@ impl SignedPrekeyStore {
         let record = publishable_signed_prekey(identity, key_id, &key);
         Self { state: Mutex::new(SignedPrekeyState { current: SignedPrekeyEntry { key_id, created_at_ms: now_ms, expires_at_ms: None, key, record }, retired: BTreeMap::new() }) }
     }
-
-    pub fn current_record(&self) -> Result<SignedPrekeyRecord, SignedPrekeyStoreError> {
-        let state = self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?;
-        Ok(state.current.record.clone())
-    }
-    pub fn current_key_id(&self) -> Result<u32, SignedPrekeyStoreError> {
-        Ok(self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?.current.key_id)
-    }
-
-    /// Returns a private key for a published id while retaining it in storage.
-    /// The callback must remain bounded; callers should perform only the required
-    /// session operation here so the mutex is not held across network I/O.
-    pub fn with_key<R, F>(&self, key_id: u32, now_ms: u64, operation: F) -> Result<R, SignedPrekeyStoreError>
-    where F: FnOnce(&SignedPrekey) -> R {
+    pub fn current_record(&self) -> Result<SignedPrekeyRecord, SignedPrekeyStoreError> { let state = self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?; Ok(state.current.record.clone()) }
+    pub fn current_key_id(&self) -> Result<u32, SignedPrekeyStoreError> { Ok(self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?.current.key_id) }
+    pub fn with_key<R, F>(&self, key_id: u32, now_ms: u64, operation: F) -> Result<R, SignedPrekeyStoreError> where F: FnOnce(&SignedPrekey) -> R {
         let state = self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?;
         if state.current.key_id == key_id { return Ok(operation(&state.current.key)); }
         let entry = state.retired.get(&key_id).ok_or(SignedPrekeyStoreError::NotFound)?;
         if entry.expires_at_ms.is_some_and(|expires| now_ms >= expires) { return Err(SignedPrekeyStoreError::NotFound); }
         Ok(operation(&entry.key))
     }
-
-    /// Rotates to a fresh signed prekey. Expired retired keys are removed first.
-    /// A live grace key is never silently discarded; rotation fails at the bound.
     pub fn rotate(&self, identity: &IdentityKey, new_key_id: u32, now_ms: u64, grace_ms: u64) -> Result<SignedPrekeyRecord, SignedPrekeyStoreError> {
         let mut state = self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?;
         state.retired.retain(|_, entry| entry.expires_at_ms.is_none_or(|expires| now_ms < expires));
@@ -61,27 +47,17 @@ impl SignedPrekeyStore {
         if now_ms < state.current.created_at_ms { return Err(SignedPrekeyStoreError::InvalidTime); }
         if state.retired.len() >= MAX_RETIRED_SIGNED_PREKEYS { return Err(SignedPrekeyStoreError::RetiredCapacity); }
         let expires_at_ms = now_ms.checked_add(grace_ms).ok_or(SignedPrekeyStoreError::GenerationOverflow)?;
-        let key = SignedPrekey::generate();
-        let record = publishable_signed_prekey(identity, new_key_id, &key);
+        let key = SignedPrekey::generate(); let record = publishable_signed_prekey(identity, new_key_id, &key);
         let old = std::mem::replace(&mut state.current, SignedPrekeyEntry { key_id: new_key_id, created_at_ms: now_ms, expires_at_ms: None, key, record });
         state.retired.insert(old.key_id, SignedPrekeyEntry { expires_at_ms: Some(expires_at_ms), ..old });
         Ok(state.current.record.clone())
     }
-
-    pub fn prune(&self, now_ms: u64) -> Result<usize, SignedPrekeyStoreError> {
-        let mut state = self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?;
-        let before = state.retired.len();
-        state.retired.retain(|_, entry| entry.expires_at_ms.is_none_or(|expires| now_ms < expires));
-        Ok(before - state.retired.len())
-    }
-    pub fn retired_len(&self) -> Result<usize, SignedPrekeyStoreError> {
-        Ok(self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?.retired.len())
-    }
+    pub fn prune(&self, now_ms: u64) -> Result<usize, SignedPrekeyStoreError> { let mut state = self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?; let before = state.retired.len(); state.retired.retain(|_, entry| entry.expires_at_ms.is_none_or(|expires| now_ms < expires)); Ok(before - state.retired.len()) }
+    pub fn retired_len(&self) -> Result<usize, SignedPrekeyStoreError> { Ok(self.state.lock().map_err(|_| SignedPrekeyStoreError::Poisoned)?.retired.len()) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreKeyStoreError { DuplicateKeyId, NotFound, PublicKeyMismatch, Poisoned }
-
 pub struct OneTimePrekeyStore { keys: Mutex<BTreeMap<u32, OneTimePrekey>> }
 impl OneTimePrekeyStore {
     pub fn new() -> Self { Self { keys: Mutex::new(BTreeMap::new()) } }
@@ -100,7 +76,7 @@ mod tests {
     #[test] fn signed_prekey_rotation_keeps_old_key_during_grace() { let identity=IdentityKey::generate(); let store=SignedPrekeyStore::new(&identity,1,1_000); let old=store.current_record().unwrap(); let fresh=store.rotate(&identity,2,2_000,500).unwrap(); assert_eq!(fresh.key_id,2); assert_eq!(store.current_key_id().unwrap(),2); assert_eq!(store.retired_len().unwrap(),1); assert!(store.with_key(old.key_id,2_499, |_| ()).is_ok()); assert!(matches!(store.with_key(old.key_id,2_500, |_| ()),Err(SignedPrekeyStoreError::NotFound))); assert_eq!(store.prune(2_500).unwrap(),1); assert_eq!(store.retired_len().unwrap(),0); }
     #[test] fn signed_prekey_rotation_rejects_id_reuse_and_time_rollback() { let identity=IdentityKey::generate(); let store=SignedPrekeyStore::new(&identity,4,10_000); assert!(matches!(store.rotate(&identity,4,11_000,1),Err(SignedPrekeyStoreError::DuplicateKeyId))); assert!(matches!(store.rotate(&identity,5,9_999,1),Err(SignedPrekeyStoreError::InvalidTime))); store.rotate(&identity,5,11_000,10).unwrap(); assert!(matches!(store.rotate(&identity,4,12_000,10),Ok(_))); assert_eq!(store.current_key_id().unwrap(),4); }
     #[test] fn signed_prekey_record_stays_bound_after_rotation() { let identity=IdentityKey::generate(); let store=SignedPrekeyStore::new(&identity,7,100); let record=store.current_record().unwrap(); assert!(record.verify(&identity.public_key())); let _=store.rotate(&identity,8,200,DEFAULT_SIGNED_PREKEY_GRACE_MS).unwrap(); assert!(store.with_key(record.key_id,200,|key| assert_eq!(key.public_key(),record.public_key)).is_ok()); }
-    #[test] fn signed_prekey_retirement_is_bounded_without_deleting_live_keys() { let identity=IdentityKey::generate(); let store=SignedPrekeyStore::new(&identity,1,0); store.rotate(&identity,2,1,1_000).unwrap(); store.rotate(&identity,3,2,1_000).unwrap(); assert_eq!(store.retired_len().unwrap(),1); assert!(store.with_key(1,999, |_| ()).is_err()); assert!(store.with_key(2,999, |_| ()).is_ok()); assert_eq!(store.current_key_id().unwrap(),3); assert_eq!(store.retired_len().unwrap(),1); assert_eq!(store.prune(1_001).unwrap(),1); assert_eq!(store.retired_len().unwrap(),0); store.rotate(&identity,4,1_002,1).unwrap(); assert_eq!(store.current_key_id().unwrap(),4); }
+    #[test] fn signed_prekey_retirement_is_bounded_without_deleting_live_keys() { let identity=IdentityKey::generate(); let store=SignedPrekeyStore::new(&identity,1,0); store.rotate(&identity,2,1,1_000).unwrap(); store.rotate(&identity,3,2,1_000).unwrap(); assert_eq!(store.retired_len().unwrap(),2); assert!(store.with_key(1,999, |_| ()).is_ok()); assert!(store.with_key(2,999, |_| ()).is_ok()); assert_eq!(store.current_key_id().unwrap(),3); assert_eq!(store.prune(1_001).unwrap(),1); assert_eq!(store.retired_len().unwrap(),1); assert!(store.with_key(2,1_001, |_| ()).is_ok()); assert!(store.with_key(1,1_001, |_| ()).is_err()); assert_eq!(store.prune(1_002).unwrap(),1); assert_eq!(store.retired_len().unwrap(),0); store.rotate(&identity,4,1_003,1).unwrap(); assert_eq!(store.current_key_id().unwrap(),4); }
     #[test] fn duplicate_ids_are_rejected() { let store=OneTimePrekeyStore::new(); store.insert(OneTimePrekey::generate(7)).unwrap(); assert!(matches!(store.insert(OneTimePrekey::generate(7)),Err(PreKeyStoreError::DuplicateKeyId))); assert_eq!(store.len().unwrap(),1); }
     #[test] fn take_is_single_use() { let store=OneTimePrekeyStore::new(); store.insert(OneTimePrekey::generate(8)).unwrap(); let first=store.take(8).unwrap(); assert_eq!(first.key_id,8); assert!(matches!(store.take(8),Err(PreKeyStoreError::NotFound))); assert!(store.is_empty().unwrap()); }
     #[test] fn mismatched_public_key_does_not_consume_prekey() { let store=OneTimePrekeyStore::new(); let key=OneTimePrekey::generate(10); let public=key.public_key(); store.insert(key).unwrap(); assert!(matches!(store.take_matching(10,&[1u8;32]),Err(PreKeyStoreError::PublicKeyMismatch))); assert_eq!(store.len().unwrap(),1); let consumed=store.take_matching(10,&public).unwrap(); assert_eq!(consumed.key_id,10); assert!(store.is_empty().unwrap()); }

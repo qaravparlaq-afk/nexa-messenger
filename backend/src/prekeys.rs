@@ -1,6 +1,7 @@
 use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 use nexa_protocol::{PreKeyBundle, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use std::{collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use tokio::sync::Mutex;
 
@@ -14,6 +15,7 @@ pub struct PreKeyPublication {
     pub generation: u64,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+    #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }
 

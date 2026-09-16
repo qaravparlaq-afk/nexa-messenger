@@ -1,4 +1,5 @@
 mod auth;
+mod prekeys;
 mod relay;
 
 use axum::{
@@ -12,6 +13,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use nexa_protocol::{decode_message_ack, EncryptedMessage};
 use nexa_transport::{Frame, FrameKind, MAX_FRAME};
+use prekeys::{PreKeyPublication, PreKeyRegistry};
 use relay::{PushResult, RelayStore};
 use std::{collections::{HashMap, HashSet, VecDeque}, net::SocketAddr, str::FromStr, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 use tokio::{sync::{mpsc, Mutex}, time::{timeout, Instant}};
@@ -78,10 +80,15 @@ impl ConnectionRegistry {
 }
 
 #[derive(Clone)]
-struct AppState { relay: RelayStore, auth: auth::AuthState, connections: ConnectionRegistry }
+struct AppState {
+    relay: RelayStore,
+    auth: auth::AuthState,
+    connections: ConnectionRegistry,
+    prekeys: PreKeyRegistry,
+}
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"service":"nexa-gateway","status":"ok","plaintext_storage":false,"environment":"development","authentication":"ed25519","websocket":true,"live_routing":true}))
+    Json(serde_json::json!({"service":"nexa-gateway","status":"ok","plaintext_storage":false,"environment":"development","authentication":"ed25519","websocket":true,"live_routing":true,"prekey_publication":true}))
 }
 
 async fn enqueue(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
@@ -115,6 +122,28 @@ async fn ack(State(state): State<AppState>, headers: HeaderMap, Path((device, me
     if state.relay.ack(device_id, message_id_bytes).await { Ok(StatusCode::NO_CONTENT) } else { Ok(StatusCode::NOT_FOUND) }
 }
 
+async fn publish_prekeys(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
+    let authenticated = state.auth.authenticate(&headers, &Method::POST, "/v1/prekeys", &body).await.map_err(auth_status)?;
+    let publication: PreKeyPublication = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if publication.bundle.device_id != authenticated { return Err(StatusCode::FORBIDDEN); }
+    state.prekeys.publish(publication, prekeys::now_ms()).await.map_err(publication_status)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn get_prekeys(State(state): State<AppState>, Path(device): Path<String>) -> Result<Json<PreKeyPublication>, StatusCode> {
+    let device_id = hex_to_16(&device).ok_or(StatusCode::BAD_REQUEST)?;
+    state.prekeys.get_active(device_id, prekeys::now_ms()).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn revoke_prekeys(State(state): State<AppState>, headers: HeaderMap, Path((device, generation)): Path<(String, u64)>) -> Result<StatusCode, StatusCode> {
+    let device_id = hex_to_16(&device).ok_or(StatusCode::BAD_REQUEST)?;
+    let path = format!("/v1/prekeys/{device}/{generation}/revoke");
+    let authenticated = state.auth.authenticate(&headers, &Method::POST, &path, &[]).await.map_err(auth_status)?;
+    if authenticated != device_id { return Err(StatusCode::FORBIDDEN); }
+    state.prekeys.revoke(device_id, generation, prekeys::now_ms()).await.map_err(publication_status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn websocket(State(state): State<AppState>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Result<Response, StatusCode> {
     let device = state.auth.authenticate(&headers, &Method::GET, "/v1/ws", &[]).await.map_err(auth_status)?;
     Ok(upgrade.max_frame_size(WS_MAX_MESSAGE).max_message_size(WS_MAX_MESSAGE).on_upgrade(move |socket| websocket_session(socket, device, state.relay, state.connections)))
@@ -125,7 +154,6 @@ async fn websocket_session(mut socket: WebSocket, device: [u8; 16], relay: Relay
         Ok(Some(Ok(message))) => message,
         _ => { close(&mut socket).await; return; }
     };
-
     let Message::Binary(bytes) = first else { close(&mut socket).await; return; };
     if bytes.len() > WS_MAX_MESSAGE { close(&mut socket).await; return; }
     let Ok(frame) = Frame::from_bytes(&bytes) else { close(&mut socket).await; return; };
@@ -133,32 +161,19 @@ async fn websocket_session(mut socket: WebSocket, device: [u8; 16], relay: Relay
     if kind != FrameKind::ClientHello || frame.payload != device { close(&mut socket).await; return; }
 
     let (connection_id, mut outbound) = connections.register(device).await;
-    if let Err(()) = send_hello(&mut socket, device).await {
-        connections.unregister(device, connection_id).await;
-        return;
-    }
-
+    if let Err(()) = send_hello(&mut socket, device).await { connections.unregister(device, connection_id).await; return; }
     let backlog = relay.pull(device).await;
     let delivered_ids: HashSet<[u8; 16]> = backlog.iter().map(|message| message.message_id).collect();
     for message in backlog {
-        if send_encrypted(&mut socket, message).await.is_err() {
-            connections.unregister(device, connection_id).await;
-            return;
-        }
+        if send_encrypted(&mut socket, message).await.is_err() { connections.unregister(device, connection_id).await; return; }
     }
-    if !connections.activate(device, connection_id, &delivered_ids).await {
-        return;
-    }
+    if !connections.activate(device, connection_id, &delivered_ids).await { return; }
 
     let mut last_activity = Instant::now();
     loop {
         let idle_deadline = last_activity + WS_IDLE_TIMEOUT;
         tokio::select! {
-            _ = tokio::time::sleep_until(idle_deadline) => {
-                close(&mut socket).await;
-                connections.unregister(device, connection_id).await;
-                return;
-            }
+            _ = tokio::time::sleep_until(idle_deadline) => { close(&mut socket).await; connections.unregister(device, connection_id).await; return; }
             inbound = socket.next() => {
                 let Some(result) = inbound else { connections.unregister(device, connection_id).await; return; };
                 let Ok(message) = result else { connections.unregister(device, connection_id).await; return; };
@@ -170,16 +185,8 @@ async fn websocket_session(mut socket: WebSocket, device: [u8; 16], relay: Relay
             }
             outbound_result = outbound.recv() => {
                 match outbound_result {
-                    Some(message) => {
-                        if send_encrypted(&mut socket, message).await.is_err() {
-                            connections.unregister(device, connection_id).await;
-                            return;
-                        }
-                    }
-                    None => {
-                        connections.unregister(device, connection_id).await;
-                        return;
-                    }
+                    Some(message) => { if send_encrypted(&mut socket, message).await.is_err() { connections.unregister(device, connection_id).await; return; } }
+                    None => { connections.unregister(device, connection_id).await; return; }
                 }
             }
         }
@@ -213,17 +220,11 @@ async fn handle_authenticated_message(socket: &mut WebSocket, message: Message, 
                     let message_id = decode_message_ack(&frame.payload).map_err(|_| ())?;
                     let _ = relay.ack(device, message_id).await;
                 }
-                FrameKind::ClientHello | FrameKind::MessageBatch | FrameKind::PreKeyBundle | FrameKind::PreKeyRequest => {
-                    close(socket).await;
-                    return Err(());
-                }
+                FrameKind::ClientHello | FrameKind::MessageBatch | FrameKind::PreKeyBundle | FrameKind::PreKeyRequest => { close(socket).await; return Err(()); }
             }
             Ok(true)
         }
-        Message::Ping(bytes) => {
-            socket.send(Message::Pong(bytes)).await.map_err(|_| ())?;
-            Ok(true)
-        }
+        Message::Ping(bytes) => { socket.send(Message::Pong(bytes)).await.map_err(|_| ())?; Ok(true) }
         Message::Pong(_) => Ok(true),
         Message::Text(_) | Message::Close(_) => Ok(false),
     }
@@ -251,6 +252,17 @@ fn auth_status(error: auth::AuthError) -> StatusCode {
     }
 }
 
+fn publication_status(error: prekeys::PublicationError) -> StatusCode {
+    match error {
+        prekeys::PublicationError::InvalidBundle | prekeys::PublicationError::InvalidVersion | prekeys::PublicationError::InvalidTime | prekeys::PublicationError::Expired | prekeys::PublicationError::TooLong | prekeys::PublicationError::InvalidSignature => StatusCode::BAD_REQUEST,
+        prekeys::PublicationError::WrongDevice => StatusCode::FORBIDDEN,
+        prekeys::PublicationError::StaleGeneration => StatusCode::CONFLICT,
+        prekeys::PublicationError::NotFound => StatusCode::NOT_FOUND,
+        prekeys::PublicationError::AlreadyRevoked => StatusCode::CONFLICT,
+        prekeys::PublicationError::Poisoned => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 fn hex_to_16(input: &str) -> Option<[u8; 16]> {
     if input.len() != 32 { return None; }
     let mut out = [0u8; 16];
@@ -260,12 +272,15 @@ fn hex_to_16(input: &str) -> Option<[u8; 16]> {
 
 #[tokio::main]
 async fn main() {
-    let state = AppState { relay: RelayStore::default(), auth: auth::AuthState::default(), connections: ConnectionRegistry::default() };
+    let state = AppState { relay: RelayStore::default(), auth: auth::AuthState::default(), connections: ConnectionRegistry::default(), prekeys: PreKeyRegistry::default() };
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/relay", post(enqueue))
         .route("/v1/relay/{device_id}", get(poll))
         .route("/v1/relay/{device_id}/{message_id}/ack", post(ack))
+        .route("/v1/prekeys", post(publish_prekeys))
+        .route("/v1/prekeys/{device_id}", get(get_prekeys))
+        .route("/v1/prekeys/{device_id}/{generation}/revoke", post(revoke_prekeys))
         .route("/v1/ws", get(websocket))
         .with_state(state);
     let bind = std::env::var("NEXA_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
@@ -288,43 +303,26 @@ mod tests {
 
     #[tokio::test]
     async fn registry_replaces_stale_connection_without_stale_unregister() {
-        let registry = ConnectionRegistry::default();
-        let device = [7u8; 16];
-        let (old_id, _old_rx) = registry.register(device).await;
-        let (new_id, mut new_rx) = registry.register(device).await;
-        assert_ne!(old_id, new_id);
-        registry.unregister(device, old_id).await;
-        registry.try_send(device, test_message(1, device)).await;
-        assert!(new_rx.try_recv().is_err());
+        let registry = ConnectionRegistry::default(); let device = [7u8; 16];
+        let (old_id, _old_rx) = registry.register(device).await; let (new_id, mut new_rx) = registry.register(device).await;
+        assert_ne!(old_id, new_id); registry.unregister(device, old_id).await; registry.try_send(device, test_message(1, device)).await; assert!(new_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn registry_queues_live_messages_during_backlog_and_deduplicates() {
-        let registry = ConnectionRegistry::default();
-        let device = [8u8; 16];
-        let (id, mut rx) = registry.register(device).await;
-        let duplicate = test_message(1, device);
-        let live_only = test_message(2, device);
-        registry.try_send(device, duplicate.clone()).await;
-        registry.try_send(device, live_only.clone()).await;
-        let mut delivered = HashSet::new();
-        delivered.insert(duplicate.message_id);
-        assert!(registry.activate(device, id, &delivered).await);
-        assert_eq!(rx.try_recv().unwrap().message_id, live_only.message_id);
-        assert!(rx.try_recv().is_err());
+        let registry = ConnectionRegistry::default(); let device = [8u8; 16]; let (id, mut rx) = registry.register(device).await;
+        let duplicate = test_message(1, device); let live_only = test_message(2, device);
+        registry.try_send(device, duplicate.clone()).await; registry.try_send(device, live_only.clone()).await;
+        let mut delivered = HashSet::new(); delivered.insert(duplicate.message_id);
+        assert!(registry.activate(device, id, &delivered).await); assert_eq!(rx.try_recv().unwrap().message_id, live_only.message_id); assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn registry_backpressure_never_blocks_sender() {
-        let registry = ConnectionRegistry::default();
-        let device = [9u8; 16];
-        let (id, mut rx) = registry.register(device).await;
-        let delivered = HashSet::new();
-        assert!(registry.activate(device, id, &delivered).await);
+        let registry = ConnectionRegistry::default(); let device = [9u8; 16]; let (id, mut rx) = registry.register(device).await;
+        assert!(registry.activate(device, id, &HashSet::new()).await);
         for i in 0..LIVE_CHANNEL_CAPACITY { registry.try_send(device, test_message((i as u8).wrapping_add(1), device)).await; }
         registry.try_send(device, test_message(255, device)).await;
-        let mut received = 0;
-        while rx.try_recv().is_ok() { received += 1; }
-        assert_eq!(received, LIVE_CHANNEL_CAPACITY);
+        let mut received = 0; while rx.try_recv().is_ok() { received += 1; } assert_eq!(received, LIVE_CHANNEL_CAPACITY);
     }
 }

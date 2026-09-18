@@ -10,6 +10,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const DOMAIN: &[u8] = b"M/SESSION/v1";
 const ROOT_LEN: usize = 32;
+const INIT_DOMAIN: &[u8] = b"M/SESSION-INIT/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError { ProtocolVersion, InvalidBundle(PreKeyBundleError), InvalidSignedPrekey, InvalidPeerIdentity, InvalidOneTimePrekey, InvalidSharedSecret, KeyDerivation, PreKeyStore(PreKeyStoreError) }
@@ -18,7 +19,13 @@ pub struct InitiatorEphemeral { secret: Zeroizing<[u8; 32]>, pub public_key: [u8
 impl InitiatorEphemeral { pub fn generate() -> Self { let secret=StaticSecret::random_from_rng(rand_core::OsRng); Self{public_key:PublicKey::from(&secret).to_bytes(),secret:Zeroizing::new(secret.to_bytes())} } }
 pub struct SessionRoot(Zeroizing<[u8; ROOT_LEN]>);
 impl SessionRoot { pub fn as_bytes(&self)->&[u8;ROOT_LEN]{&self.0} }
-pub struct InitiatorSession{pub root:SessionRoot,pub peer_device_id:[u8;16],pub used_one_time_prekey_id:Option<u32>}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInit { pub identity_signing_key: [u8; 32], pub identity_agreement_key: [u8; 32], pub ephemeral_public_key: [u8; 32], pub signed_prekey_id: u32, pub one_time_prekey_id: Option<u32>, pub signature: [u8; 64] }
+impl SessionInit {
+    pub fn signing_bytes(&self) -> Vec<u8> { let mut out=INIT_DOMAIN.to_vec(); out.extend_from_slice(&self.identity_signing_key); out.extend_from_slice(&self.identity_agreement_key); out.extend_from_slice(&self.ephemeral_public_key); out.extend_from_slice(&self.signed_prekey_id.to_be_bytes()); match self.one_time_prekey_id { Some(id)=>{out.push(1);out.extend_from_slice(&id.to_be_bytes())},None=>out.push(0)} out }
+    pub fn verify(&self) -> bool { ed25519_dalek::VerifyingKey::from_bytes(&self.identity_signing_key).ok().and_then(|k| k.verify(&self.signing_bytes(), &ed25519_dalek::Signature::from_bytes(&self.signature)).ok()).is_some() }
+}
+pub struct InitiatorSession{pub root:SessionRoot,pub peer_device_id:[u8;16],pub used_one_time_prekey_id:Option<u32>,pub init:SessionInit}
 pub struct ResponderSession{pub root:SessionRoot,pub peer_device_id:[u8;16],pub used_one_time_prekey_id:Option<u32>}
 
 pub fn initiate(own_identity:&IdentityKey,own_device_id:[u8;16],own_ephemeral:&InitiatorEphemeral,bundle:&PreKeyBundle,signed_prekey_record:&SignedPrekeyRecord,one_time_prekey_public:Option<(u32,[u8;32])>)->Result<InitiatorSession,SessionError>{
@@ -31,7 +38,7 @@ pub fn initiate(own_identity:&IdentityKey,own_device_id:[u8;16],own_ephemeral:&I
     if is_zero(&dh1)||is_zero(&dh2)||is_zero(&dh3){return Err(SessionError::InvalidSharedSecret);}
     let mut ikm=Vec::with_capacity(128);ikm.extend_from_slice(&dh1);ikm.extend_from_slice(&dh2);ikm.extend_from_slice(&dh3);
     let used_id=if let Some((id,public))=one_time_prekey_public{if !bundle.one_time_prekeys.iter().any(|entry| entry.key_id==id&&entry.public_key==public){return Err(SessionError::InvalidOneTimePrekey);}let dh4=own_ephemeral_secret.diffie_hellman(&PublicKey::from(public)).to_bytes();if is_zero(&dh4){return Err(SessionError::InvalidSharedSecret);}ikm.extend_from_slice(&dh4);Some(id)}else{None};
-    let root=derive_root(&ikm,&own_device_id,&bundle.device_id,&own_ephemeral.public_key).ok_or(SessionError::KeyDerivation)?;ikm.zeroize();Ok(InitiatorSession{root,peer_device_id:bundle.device_id,used_one_time_prekey_id:used_id})
+    let root=derive_root(&ikm,&own_device_id,&bundle.device_id,&own_ephemeral.public_key).ok_or(SessionError::KeyDerivation)?;ikm.zeroize();let mut init=SessionInit{identity_signing_key:own_identity.public_key().to_bytes(),identity_agreement_key:own_identity.agreement_public_key(),ephemeral_public_key:own_ephemeral.public_key,signed_prekey_id:bundle.signed_prekey_id,one_time_prekey_id:used_id,signature:[0;64]};init.signature=own_identity.sign(&init.signing_bytes()).to_bytes();Ok(InitiatorSession{root,peer_device_id:bundle.device_id,used_one_time_prekey_id:used_id,init})
 }
 
 pub fn respond(own_identity:&IdentityKey,own_signed_prekey:&SignedPrekey,own_one_time_prekey:Option<(u32,OneTimePrekey)>,own_device_id:[u8;16],peer_device_id:[u8;16],peer_identity_agreement_key:[u8;32],peer_ephemeral_public:[u8;32])->Result<ResponderSession,SessionError>{

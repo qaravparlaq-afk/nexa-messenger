@@ -214,9 +214,9 @@ mod tests {
     async fn publication_is_signed_and_monotonic() {
         let key = SigningKey::from_bytes(&[42; 32]); let r = PreKeyRegistry::default();
         let p1 = publication(&key, 1); let d = p1.bundle.device_id;
-        assert!(r.publish(p1.clone(), now_ms()).await.is_ok());
-        assert!(matches!(r.publish(p1, now_ms()).await, Err(PublicationError::StaleGeneration)));
-        let p2 = publication(&key, 2); assert!(r.publish(p2, now_ms()).await.is_ok());
+        assert!(r.publish(d, p1.clone(), now_ms()).await.is_ok());
+        assert!(matches!(r.publish(d, p1, now_ms()).await, Err(PublicationError::StaleGeneration)));
+        let p2 = publication(&key, 2); assert!(r.publish(p2.bundle.device_id, p2, now_ms()).await.is_ok());
         assert_eq!(r.get(d).await.unwrap().generation, 2);
     }
 
@@ -235,7 +235,7 @@ mod tests {
         r.revoke(d, 5, now_ms()).await.unwrap();
         assert!(r.is_revoked(d).await); assert!(r.get(d).await.unwrap().verify_signature());
         assert!(r.get_active(d, now_ms()).await.is_none());
-        assert!(matches!(r.publish(publication(&key, 6), now_ms()).await, Err(PublicationError::AlreadyRevoked)));
+        assert!(matches!({ let p = publication(&key, 6); r.publish(p.bundle.device_id, p, now_ms()) }.await, Err(PublicationError::AlreadyRevoked)));
     }
 
     #[tokio::test]

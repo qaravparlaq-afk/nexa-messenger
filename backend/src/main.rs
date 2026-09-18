@@ -126,7 +126,7 @@ async fn publish_prekeys(State(state): State<AppState>, headers: HeaderMap, body
     let authenticated = state.auth.authenticate(&headers, &Method::POST, "/v1/prekeys", &body).await.map_err(auth_status)?;
     let publication: PreKeyPublication = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     if publication.bundle.device_id != authenticated { return Err(StatusCode::FORBIDDEN); }
-    state.prekeys.publish(publication, prekeys::now_ms()).await.map_err(publication_status)?;
+    state.prekeys.publish(authenticated, publication, prekeys::now_ms()).await.map_err(publication_status)?;
     Ok(StatusCode::ACCEPTED)
 }
 

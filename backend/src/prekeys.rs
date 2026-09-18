@@ -223,15 +223,15 @@ mod tests {
     #[tokio::test]
     async fn tampering_is_rejected() {
         let key = SigningKey::from_bytes(&[43; 32]); let r = PreKeyRegistry::default(); let mut p = publication(&key, 1);
-        p.bundle.signed_prekey[0] ^= 1; assert!(matches!(r.publish(p, now_ms()).await, Err(PublicationError::InvalidSignature)));
+        p.bundle.signed_prekey[0] ^= 1; assert!(matches!(r.publish(p.bundle.device_id, p, now_ms()).await, Err(PublicationError::InvalidSignature)));
         let mut p = publication(&key, 1); p.signature[0] ^= 1;
-        assert!(matches!(r.publish(p, now_ms()).await, Err(PublicationError::InvalidSignature)));
+        assert!(matches!(r.publish(p.bundle.device_id, p, now_ms()).await, Err(PublicationError::InvalidSignature)));
     }
 
     #[tokio::test]
     async fn revocation_blocks_republish_without_invalidating_publication_signature() {
         let key = SigningKey::from_bytes(&[44; 32]); let r = PreKeyRegistry::default();
-        let p = publication(&key, 5); let d = p.bundle.device_id; r.publish(p, now_ms()).await.unwrap();
+        let p = publication(&key, 5); let d = p.bundle.device_id; r.publish(p.bundle.device_id, p, now_ms()).await.unwrap();
         r.revoke(d, 5, now_ms()).await.unwrap();
         assert!(r.is_revoked(d).await); assert!(r.get(d).await.unwrap().verify_signature());
         assert!(r.get_active(d, now_ms()).await.is_none());
@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn opk_claim_is_atomic_and_idempotent() {
         let key = SigningKey::from_bytes(&[45; 32]); let r = PreKeyRegistry::default();
-        let p = publication(&key, 7); let recipient = p.bundle.device_id; r.publish(p, now_ms()).await.unwrap();
+        let p = publication(&key, 7); let recipient = p.bundle.device_id; r.publish(p.bundle.device_id, p, now_ms()).await.unwrap();
         let claimant = [8u8; 16]; let request = [9u8; 16];
         let first = r.claim_opk(recipient, 7, 9, claimant, request, now_ms()).await.unwrap();
         let retry = r.claim_opk(recipient, 7, 9, claimant, request, now_ms()).await.unwrap();
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_opk_claim_has_exactly_one_winner() {
         let key = SigningKey::from_bytes(&[46; 32]); let r = PreKeyRegistry::default();
-        let p = publication(&key, 8); let recipient = p.bundle.device_id; r.publish(p, now_ms()).await.unwrap();
+        let p = publication(&key, 8); let recipient = p.bundle.device_id; r.publish(p.bundle.device_id, p, now_ms()).await.unwrap();
         let mut tasks = Vec::new();
         for i in 0u8..16 {
             let registry = r.clone();

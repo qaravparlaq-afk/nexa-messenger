@@ -111,9 +111,9 @@ pub struct PreKeyRegistry {
 }
 
 impl PreKeyRegistry {
-    pub async fn publish(&self, publication: PreKeyPublication, now_ms: u64) -> Result<(), PublicationError> {
+    pub async fn publish(&self, expected_device: [u8; 16], publication: PreKeyPublication, now_ms: u64) -> Result<(), PublicationError> {
         let device = publication.bundle.device_id;
-        publication.validate(device, now_ms)?;
+        publication.validate(expected_device, now_ms)?;
         let mut guard = self.inner.lock().await;
         if guard.revoked.contains_key(&device) { return Err(PublicationError::AlreadyRevoked); }
         if let Some(current) = guard.publications.get(&device) {

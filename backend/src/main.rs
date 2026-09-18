@@ -13,7 +13,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use nexa_protocol::{decode_message_ack, EncryptedMessage};
 use nexa_transport::{Frame, FrameKind, MAX_FRAME};
-use prekeys::{PreKeyPublication, PreKeyRegistry};
+use prekeys::{OpkClaimRequest, PreKeyPublication, PreKeyRegistry};
 use relay::{PushResult, RelayStore};
 use std::{collections::{HashMap, HashSet, VecDeque}, net::SocketAddr, str::FromStr, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 use tokio::{sync::{mpsc, Mutex}, time::{timeout, Instant}};
@@ -88,7 +88,7 @@ struct AppState {
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"service":"nexa-gateway","status":"ok","plaintext_storage":false,"environment":"development","authentication":"ed25519","websocket":true,"live_routing":true,"prekey_publication":true}))
+    Json(serde_json::json!({"service":"nexa-gateway","status":"ok","plaintext_storage":false,"environment":"development","authentication":"ed25519","websocket":true,"live_routing":true,"prekey_publication":true,"opk_claims":true}))
 }
 
 async fn enqueue(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<StatusCode, StatusCode> {
@@ -142,6 +142,21 @@ async fn revoke_prekeys(State(state): State<AppState>, headers: HeaderMap, Path(
     if authenticated != device_id { return Err(StatusCode::FORBIDDEN); }
     state.prekeys.revoke(device_id, generation, prekeys::now_ms()).await.map_err(publication_status)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn claim_prekey(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((recipient, generation, key_id)): Path<(String, u64, u32)>,
+    body: Bytes,
+) -> Result<Json<prekeys::OpkClaim>, StatusCode> {
+    let recipient_id = hex_to_16(&recipient).ok_or(StatusCode::BAD_REQUEST)?;
+    let path = format!("/v1/prekeys/{recipient}/{generation}/{key_id}/claim");
+    let claimant = state.auth.authenticate(&headers, &Method::POST, &path, &body).await.map_err(auth_status)?;
+    let request: OpkClaimRequest = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let claim = state.prekeys.claim_opk(recipient_id, generation, key_id, claimant, request.request_id, prekeys::now_ms())
+        .await.map_err(publication_status)?;
+    Ok(Json(claim))
 }
 
 async fn websocket(State(state): State<AppState>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Result<Response, StatusCode> {
@@ -254,11 +269,10 @@ fn auth_status(error: auth::AuthError) -> StatusCode {
 
 fn publication_status(error: prekeys::PublicationError) -> StatusCode {
     match error {
-        prekeys::PublicationError::InvalidBundle | prekeys::PublicationError::InvalidVersion | prekeys::PublicationError::InvalidTime | prekeys::PublicationError::Expired | prekeys::PublicationError::TooLong | prekeys::PublicationError::InvalidSignature => StatusCode::BAD_REQUEST,
+        prekeys::PublicationError::InvalidBundle | prekeys::PublicationError::InvalidVersion | prekeys::PublicationError::InvalidTime | prekeys::PublicationError::Expired | prekeys::PublicationError::TooLong | prekeys::PublicationError::InvalidSignature | prekeys::PublicationError::InvalidRequest => StatusCode::BAD_REQUEST,
         prekeys::PublicationError::WrongDevice => StatusCode::FORBIDDEN,
-        prekeys::PublicationError::StaleGeneration => StatusCode::CONFLICT,
+        prekeys::PublicationError::StaleGeneration | prekeys::PublicationError::AlreadyClaimed | prekeys::PublicationError::AlreadyRevoked => StatusCode::CONFLICT,
         prekeys::PublicationError::NotFound => StatusCode::NOT_FOUND,
-        prekeys::PublicationError::AlreadyRevoked => StatusCode::CONFLICT,
         prekeys::PublicationError::Poisoned => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -281,6 +295,7 @@ async fn main() {
         .route("/v1/prekeys", post(publish_prekeys))
         .route("/v1/prekeys/{device_id}", get(get_prekeys))
         .route("/v1/prekeys/{device_id}/{generation}/revoke", post(revoke_prekeys))
+        .route("/v1/prekeys/{device_id}/{generation}/{key_id}/claim", post(claim_prekey))
         .route("/v1/ws", get(websocket))
         .with_state(state);
     let bind = std::env::var("NEXA_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
